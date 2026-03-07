@@ -36,6 +36,11 @@ checkpoints/
 data/
 wandb/
 
+# Node / Next.js
+node_modules/
+.next/
+.turbo/
+
 # Misc
 .env
 *.log

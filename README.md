@@ -51,25 +51,46 @@ Input Tokens
 ## Project Structure
 
 ```text
-clsa/
-  config/           # TransformerConfig, CLSAConfig
-  modules/          # Custom transformer, cognitive modules, weight loading
-  deliberation/     # Cross-attention, product of Gaussians, deliberation loop
-  decoder/          # Projection interface (latent states -> tokens)
-  training/         # Phase 1/2/3 trainers, loss functions
-  evaluation/       # See-saw hypothesis test
-  model.py          # Top-level CLSA model
+clsa/                        # Core ML library
+  config/                    # TransformerConfig, CLSAConfig
+  modules/                   # Custom transformer, cognitive modules, weight loading
+  deliberation/              # Cross-attention, product of Gaussians, deliberation loop
+  decoder/                   # Projection interface (latent states -> tokens)
+  training/                  # Phase 1/2/3 trainers, loss functions
+  evaluation/                # See-saw hypothesis test
+  model.py                   # Top-level CLSA model
+services/
+  model_service/             # FastAPI wrapping CLSA inference (port 8001)
+  api/                       # FastAPI backend with Postgres + Redis (port 8000)
+  web/                       # Next.js frontend (port 3000)
 tests/
-  test_smoke.py     # Structural smoke tests
+  test_smoke.py              # Structural smoke tests
+docker-compose.yml           # Full stack orchestration
 ```
 
 ## Setup
+
+### CLSA library only (for research/training)
 
 ```bash
 # Requires Python 3.12+
 uv sync
 uv sync --group dev  # for pytest and ruff
 ```
+
+### Full stack (frontend + API + model service)
+
+```bash
+docker compose up --build
+```
+
+This starts:
+
+- **Next.js frontend** at `localhost:3000`
+- **API backend** at `localhost:8000`
+- **Model service** at `localhost:8001`
+- **Postgres** on port 5432
+- **Redis** on port 6379
 
 ## Quick Start
 

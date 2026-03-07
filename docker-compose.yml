@@ -1,0 +1,79 @@
+services:
+  # Postgres database for conversation storage
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: clsa
+      POSTGRES_PASSWORD: clsa
+      POSTGRES_DB: clsa
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clsa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for response caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # CLSA model service (PyTorch inference)
+  model-service:
+    build:
+      context: .
+      dockerfile: services/model_service/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      CLSA_DEVICE: cpu
+      CLSA_MODEL_ID: HuggingFaceTB/SmolLM2-135M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # API backend (FastAPI)
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://clsa:clsa@postgres:5432/clsa
+      REDIS_URL: redis://redis:6379/0
+      MODEL_SERVICE_URL: http://model-service:8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      model-service:
+        condition: service_healthy
+
+  # Next.js frontend
+  web:
+    build:
+      context: .
+      dockerfile: services/web/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
