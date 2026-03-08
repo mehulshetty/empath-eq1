@@ -29,7 +29,7 @@ DEFAULT_DATASETS = {
         "split": "train",
     },
     ModuleType.EQ: {
-        "path": "facebook/empathetic_dialogues",
+        "path": "allenai/prosocial-dialog",
         "name": None,
         "split": "train",
     },
@@ -110,17 +110,32 @@ def _format_arc_example(example: dict) -> str:
     return f"Question: {question} Choices: {choices_str} Answer: {answer_key}"
 
 
-def _format_empathetic_example(example: dict) -> str:
-    """Format an EmpatheticDialogues example as a text prompt.
+def _format_prosocial_example(example: dict) -> str:
+    """Format a ProsocialDialog example as a text prompt.
 
-    Concatenates the situation context with the utterance to create
-    a completion task grounded in emotional context.
+    Each example has a potentially unsafe utterance (context), a
+    prosocial response, and rules-of-thumb explaining the social
+    reasoning. Including the RoTs teaches the EQ module not just
+    what to say but why it is appropriate.
+
+    Format:
+        Situation: <context>
+        Social rule: <rot>
+        Response: <response>
     """
-    context = example.get("situation", "")
-    utterance = example.get("utterance", "")
-    if context:
-        return f"Context: {context}\nResponse: {utterance}"
-    return utterance
+    context = example.get("context", "")
+    response = example.get("response", "")
+    rots = example.get("rots", [])
+
+    parts = [f"Situation: {context}"]
+    if rots:
+        # Join multiple rules of thumb into a single line
+        rot_text = " ".join(r for r in rots if r)
+        if rot_text:
+            parts.append(f"Social rule: {rot_text}")
+    parts.append(f"Response: {response}")
+
+    return "\n".join(parts)
 
 
 def _format_counseling_example(example: dict) -> str:
@@ -193,7 +208,7 @@ def build_phase1_dataloader(
     split = dataset_split or defaults["split"]
 
     logger.info("Loading Phase 1 %s dataset: %s (%s)", module_type.value, path, name)
-    ds = load_dataset(path, name, split=split, trust_remote_code=True)
+    ds = load_dataset(path, name, split=split)
 
     if max_samples is not None:
         ds = ds.select(range(min(max_samples, len(ds))))
@@ -202,7 +217,7 @@ def build_phase1_dataloader(
     if module_type == ModuleType.LOGIC:
         texts = [_format_arc_example(ex) for ex in ds]
     elif module_type == ModuleType.EQ:
-        texts = [_format_empathetic_example(ex) for ex in ds]
+        texts = [_format_prosocial_example(ex) for ex in ds]
     else:
         raise ValueError(f"Phase 1 data not configured for {module_type}")
 
@@ -254,7 +269,7 @@ def build_phase2_dataloader(
     split = dataset_split or defaults["split"]
 
     logger.info("Loading Phase 2/3 dataset: %s", path)
-    ds = load_dataset(path, name, split=split, trust_remote_code=True)
+    ds = load_dataset(path, name, split=split)
 
     if max_samples is not None:
         ds = ds.select(range(min(max_samples, len(ds))))
