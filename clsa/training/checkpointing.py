@@ -3,6 +3,9 @@
 Phase 1 trains individual TransformerForCausalLM models. Their backbone
 weights need to be extracted and loaded into the CLSA cognitive modules
 for Phase 2. Phases 2 and 3 save/load the full CLSA model.
+
+Training state checkpoints (model + optimizer + scaler + epoch) are saved
+after each epoch so training can resume from where it left off.
 """
 
 import logging
@@ -11,6 +14,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler
 
 from clsa.config.clsa_config import ModuleType
 from clsa.model import CLSA
@@ -70,6 +74,78 @@ def load_checkpoint(
 
     logger.info("Loaded checkpoint from %s", path)
     return checkpoint.get("metadata", {})
+
+
+def save_training_state(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    epoch: int,
+    path: str | Path,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Save full training state so training can resume after interruption.
+
+    Saves model weights, optimizer state, grad scaler state, and the
+    completed epoch number.
+
+    Args:
+        model: the model being trained.
+        optimizer: the optimizer (contains momentum buffers, etc.).
+        scaler: the AMP grad scaler.
+        epoch: the epoch that just completed (0-indexed).
+        path: file path to save to.
+        metadata: optional extra info (phase, module type, losses, etc.).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "epoch": epoch,
+    }
+    if metadata:
+        checkpoint["metadata"] = metadata
+
+    torch.save(checkpoint, path)
+    logger.info("Saved training state (epoch %d) to %s", epoch, path)
+
+
+def load_training_state(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    path: str | Path,
+    device: str = "cpu",
+) -> int:
+    """Load full training state and return the next epoch to run.
+
+    Args:
+        model: the model to load weights into.
+        optimizer: the optimizer to restore state into.
+        scaler: the AMP grad scaler to restore.
+        path: path to the training state checkpoint.
+        device: device to map tensors to.
+
+    Returns:
+        The next epoch to start from (completed_epoch + 1).
+    """
+    path = Path(path)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+    completed_epoch = checkpoint["epoch"]
+    logger.info(
+        "Resumed training state from %s (completed epoch %d)",
+        path,
+        completed_epoch,
+    )
+    return completed_epoch + 1
 
 
 def save_phase1_backbone(

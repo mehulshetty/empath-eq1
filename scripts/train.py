@@ -48,6 +48,7 @@ from clsa.modules.weight_loading import (
 from clsa.training.checkpointing import (
     load_checkpoint,
     load_phase1_backbones_into_clsa,
+    load_training_state,
     save_checkpoint,
     save_phase1_backbone,
 )
@@ -71,6 +72,8 @@ MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add arguments shared across all phases."""
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
+    parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"],
+                        help="Training precision (bfloat16/float16 enable AMP on CUDA)")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-samples", type=int, default=None,
@@ -79,6 +82,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lr", type=float, default=None,
                         help="Override learning rate")
     parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader worker processes (0 = main process only)")
+    parser.add_argument("--resume", default=None,
+                        help="Path to a training state checkpoint to resume from")
 
 
 def load_tokenizer() -> AutoTokenizer:
@@ -109,6 +116,7 @@ def run_phase1(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         max_length=args.max_length,
         max_samples=args.max_samples,
+        num_workers=args.num_workers,
     )
     logger.info("Phase 1 dataloader: %d batches", len(dataloader))
 
@@ -116,10 +124,12 @@ def run_phase1(args: argparse.Namespace) -> None:
     config = TransformerConfig()
     model = TransformerForCausalLM(config)
     load_smollm2_into_causal_lm(model)
+    model.enable_gradient_checkpointing()
 
     # Configure training
     training_config = TrainingConfig(
         device=args.device,
+        dtype=args.dtype,
         phase1_epochs=args.epochs,
         phase1_lr=args.lr or 5e-5,
         log_interval=args.log_interval,
@@ -127,7 +137,17 @@ def run_phase1(args: argparse.Namespace) -> None:
 
     # Train
     trainer = Phase1Trainer(module_type, model, training_config)
-    trainer.train(dataloader)
+
+    start_epoch = 0
+    if args.resume:
+        start_epoch = trainer.resume(args.resume)
+        logger.info("Resuming Phase 1 from epoch %d", start_epoch)
+
+    trainer.train(
+        dataloader,
+        checkpoint_dir=args.output_dir,
+        start_epoch=start_epoch,
+    )
 
     # Save backbone checkpoint (strips the LM head)
     output_path = Path(args.output_dir) / f"phase1_{module_type.value}.pt"
@@ -159,6 +179,7 @@ def run_phase2(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         max_length=args.max_length,
         max_samples=args.max_samples,
+        num_workers=args.num_workers,
     )
     logger.info("Phase 2 dataloader: %d batches", len(dataloader))
 
@@ -187,6 +208,7 @@ def run_phase2(args: argparse.Namespace) -> None:
     # Configure training
     training_config = TrainingConfig(
         device=args.device,
+        dtype=args.dtype,
         phase2_epochs=args.epochs,
         phase2_lr=args.lr or 1e-4,
         log_interval=args.log_interval,
@@ -194,7 +216,17 @@ def run_phase2(args: argparse.Namespace) -> None:
 
     # Train
     trainer = Phase2Trainer(model, training_config)
-    trainer.train(dataloader)
+
+    start_epoch = 0
+    if args.resume:
+        start_epoch = trainer.resume(args.resume)
+        logger.info("Resuming Phase 2 from epoch %d", start_epoch)
+
+    trainer.train(
+        dataloader,
+        checkpoint_dir=args.output_dir,
+        start_epoch=start_epoch,
+    )
 
     # Save full CLSA checkpoint
     output_path = Path(args.output_dir) / "phase2.pt"
@@ -222,6 +254,7 @@ def run_phase3(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         max_length=args.max_length,
         max_samples=args.max_samples,
+        num_workers=args.num_workers,
     )
     logger.info("Phase 3 dataloader: %d batches", len(dataloader))
 
@@ -237,6 +270,7 @@ def run_phase3(args: argparse.Namespace) -> None:
     # Configure training
     training_config = TrainingConfig(
         device=args.device,
+        dtype=args.dtype,
         phase3_epochs=args.epochs,
         phase3_lr=args.lr or 2e-5,
         log_interval=args.log_interval,
@@ -244,7 +278,17 @@ def run_phase3(args: argparse.Namespace) -> None:
 
     # Train
     trainer = Phase3Trainer(model, training_config)
-    trainer.train(dataloader)
+
+    start_epoch = 0
+    if args.resume:
+        start_epoch = trainer.resume(args.resume)
+        logger.info("Resuming Phase 3 from epoch %d", start_epoch)
+
+    trainer.train(
+        dataloader,
+        checkpoint_dir=args.output_dir,
+        start_epoch=start_epoch,
+    )
 
     # Save final checkpoint
     output_path = Path(args.output_dir) / "phase3.pt"

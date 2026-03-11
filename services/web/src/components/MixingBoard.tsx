@@ -61,17 +61,18 @@ export default function MixingBoard({ precision, onChange }: MixingBoardProps) {
 const styles: Record<string, React.CSSProperties> = {
   container: {
     padding: "16px",
-    borderBottom: "1px solid #e0e0e0",
+    borderBottom: "1px solid #3a3a3a",
   },
   title: {
     margin: "0 0 4px 0",
     fontSize: "14px",
     fontWeight: 600,
+    color: "#e0e0e0",
   },
   subtitle: {
     margin: "0 0 12px 0",
     fontSize: "12px",
-    color: "#666",
+    color: "#777",
   },
   sliderGroup: {
     marginBottom: "12px",
@@ -87,7 +88,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   value: {
     fontFamily: "monospace",
-    color: "#444",
+    color: "#e87b5f",
   },
   slider: {
     width: "100%",

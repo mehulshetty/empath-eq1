@@ -7,10 +7,12 @@ output heads.
 """
 
 import math
+from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from clsa.config.transformer_config import TransformerConfig
 
@@ -144,6 +146,8 @@ class GroupedQueryAttention(nn.Module):
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
         # Scaled dot-product attention
+        # attention_mask is either a pre-built 4D bool (batch, 1, seq, seq)
+        # combining causal + padding, or None (SDPA applies causal internally).
         attn = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attention_mask,
@@ -225,6 +229,7 @@ class Transformer(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
@@ -258,10 +263,31 @@ class Transformer(nn.Module):
         """
         hidden_states = self.embed_tokens(input_ids)
 
+        # Build combined causal + padding mask once for all layers.
+        # When no padding mask is provided, attention_mask stays None
+        # and SDPA uses its built-in is_causal fast path instead.
+        if attention_mask is not None:
+            seq_len = input_ids.shape[1]
+            causal = torch.ones(
+                seq_len, seq_len, dtype=torch.bool, device=input_ids.device
+            ).tril()
+            padding = attention_mask.bool().unsqueeze(1).unsqueeze(2)
+            attention_mask = causal.unsqueeze(0) & padding
+
         for layer in self.layers:
-            hidden_states = layer(
-                hidden_states, self.rope_cos, self.rope_sin, attention_mask
-            )
+            if self.gradient_checkpointing and self.training:
+                hidden_states = checkpoint(
+                    layer,
+                    hidden_states,
+                    self.rope_cos,
+                    self.rope_sin,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = layer(
+                    hidden_states, self.rope_cos, self.rope_sin, attention_mask
+                )
 
         return self.norm(hidden_states)
 
@@ -282,6 +308,10 @@ class TransformerForCausalLM(nn.Module):
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing to reduce memory at the cost of speed."""
+        self.model.gradient_checkpointing = True
 
     def forward(
         self,

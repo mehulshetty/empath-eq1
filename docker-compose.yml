@@ -38,7 +38,7 @@ services:
       CLSA_DEVICE: cpu
       CLSA_MODEL_ID: HuggingFaceTB/SmolLM2-135M
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 10s
       timeout: 10s
       retries: 3

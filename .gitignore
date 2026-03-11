@@ -32,15 +32,33 @@ Thumbs.db
 *.pth
 *.bin
 *.safetensors
+*.onnx
+*.h5
+*.ckpt
 checkpoints/
 data/
 wandb/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Node / Next.js
 node_modules/
 .next/
 .turbo/
+next-env.d.ts
+package-lock.json
+
+# Fonts
+*.ttf
+*.otf
+*.woff
+*.woff2
 
 # Misc
 .env
+.env.*
 *.log
+.claude/

@@ -52,14 +52,14 @@ const styles: Record<string, React.CSSProperties> = {
   container: {
     marginTop: "8px",
     padding: "8px 12px",
-    backgroundColor: "#f5f5f5",
+    backgroundColor: "#2b2b2b",
     borderRadius: "6px",
     fontSize: "12px",
   },
   header: {
     fontWeight: 600,
     marginBottom: "6px",
-    color: "#555",
+    color: "#999",
   },
   grid: {
     display: "grid",
@@ -71,10 +71,11 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "space-between",
   },
   statLabel: {
-    color: "#777",
+    color: "#888",
   },
   statValue: {
     fontFamily: "monospace",
     fontWeight: 500,
+    color: "#e0e0e0",
   },
 };
