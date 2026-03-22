@@ -856,3 +856,100 @@ def build_phase2_dataloader(
         persistent_workers=use_workers,
         prefetch_factor=2 if use_workers else None,
     )
+
+
+def build_combined_dataloader(
+    tokenizer: PreTrainedTokenizer,
+    batch_size: int = 8,
+    max_length: int = 512,
+    max_samples: int | None = None,
+    num_workers: int = 0,
+) -> DataLoader:
+    """Build a DataLoader combining ALL training data for baseline fine-tuning.
+
+    Merges Logic (~70K), EQ (~180K), and Phase 2 multi-faculty (~30K) training
+    splits into a single corpus (~280K examples). This ensures the monolithic
+    baseline sees exactly the same data that CLSA saw across all three phases,
+    making the comparison fair.
+
+    Args:
+        tokenizer: the tokenizer to use.
+        batch_size: training batch size.
+        max_length: maximum sequence length.
+        max_samples: optional cap on total examples (applied proportionally).
+        num_workers: DataLoader worker count.
+
+    Returns:
+        DataLoader yielding {"input_ids": ..., "labels": ...} dicts.
+    """
+    all_standard = []
+    for cfg in LOGIC_DATASETS + EQ_DATASETS:
+        all_standard.append(cfg)
+    for cfg in PHASE2_DATASETS:
+        if cfg["formatter"] != "_format_persuasion_example":
+            all_standard.append(cfg)
+
+    persuasion_config = next(
+        (cfg for cfg in PHASE2_DATASETS
+         if cfg["formatter"] == "_format_persuasion_example"),
+        None,
+    )
+
+    raw_datasets = []
+    for cfg in all_standard:
+        logger.info("Loading dataset: %s (%s)", cfg["path"], cfg.get("name"))
+        ds = load_dataset(cfg["path"], cfg.get("name"), split=cfg["split"])
+        raw_datasets.append((ds, cfg["formatter"]))
+
+    persuasion_texts = []
+    if persuasion_config is not None:
+        logger.info(
+            "Loading dataset: %s (grouping utterances into dialogues)",
+            persuasion_config["path"],
+        )
+        persuasion_ds = load_dataset(
+            persuasion_config["path"],
+            persuasion_config.get("name"),
+            split=persuasion_config["split"],
+        )
+        persuasion_texts = _build_persuasion_dialogues(persuasion_ds)
+
+    standard_total = sum(len(ds) for ds, _ in raw_datasets)
+    persuasion_total = len(persuasion_texts)
+    grand_total = standard_total + persuasion_total
+
+    texts = []
+    for ds, formatter_name in raw_datasets:
+        formatter = _FORMATTERS[formatter_name]
+        if max_samples is not None:
+            cap = max(1, int(max_samples * len(ds) / grand_total))
+            cap = min(cap, len(ds))
+            ds = ds.select(range(cap))
+        logger.info("Formatting %d examples with %s", len(ds), formatter_name)
+        formatted = [formatter(ex) for ex in ds]
+        texts.extend(t for t in formatted if t)
+
+    if persuasion_texts:
+        if max_samples is not None:
+            cap = max(1, int(max_samples * persuasion_total / grand_total))
+            cap = min(cap, len(persuasion_texts))
+            persuasion_texts = persuasion_texts[:cap]
+        texts.extend(persuasion_texts)
+
+    logger.info("Combined baseline: %d total examples", len(texts))
+
+    examples = _tokenize_texts(texts, tokenizer, max_length)
+    logger.info("Produced %d tokenized examples", len(examples))
+
+    dataset = TokenizedDataset(examples)
+    use_workers = num_workers > 0
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=partial(_collate_fn, pad_token_id=tokenizer.pad_token_id),
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=use_workers,
+        prefetch_factor=2 if use_workers else None,
+    )

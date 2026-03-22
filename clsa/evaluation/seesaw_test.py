@@ -1,189 +1,141 @@
-"""See-Saw Effect evaluation framework.
+"""Shared-prompt see-saw evaluation for the CLSA hypothesis test."""
 
-Section 6.1: The core hypothesis test for CLSA. Measures whether adjusting
-one module's precision degrades another module's performance.
-
-H0: In a monolithic LLM, increasing EQ emphasis degrades logical accuracy.
-H1: In CLSA, increasing EQ precision does NOT degrade logical accuracy.
-
-The test varies pi_EQ across a range while holding pi_L constant, and
-independently measures logical accuracy and emotional appropriateness.
-"""
+from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 
-import torch
-from torch.utils.data import DataLoader
-
-from clsa.config.clsa_config import ModuleType
-from clsa.model import CLSA
+from clsa.evaluation.benchmark import BenchmarkExample
+from clsa.evaluation.generation import (
+    GeneratedResponse,
+    GenerationConfig,
+    GenerationControl,
+    ResponseGenerator,
+    generate_shared_benchmark,
+)
+from clsa.evaluation.openai_judge import JudgeScore, OpenAIJudge
+from clsa.evaluation.stats import (
+    JudgeAggregate,
+    eq_range_from_aggregates,
+    logic_variance_from_aggregates,
+    summarize_judge_scores,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class SeeSawResult:
-    """Results from a single see-saw evaluation point."""
+class SeeSawPointResult:
+    """Aggregate result for one control point in a sweep."""
 
-    eq_precision: float
-    logic_precision: float
-    logical_accuracy: float
-    emotional_score: float
-    combined_score: float  # Product, not average (penalizes trade-offs)
-    deliberation_steps: float  # Average steps taken
+    control_name: str
+    control_value: float | str
+    aggregate: JudgeAggregate
+
+    def to_dict(self) -> dict:
+        return {
+            "control_name": self.control_name,
+            "control_value": self.control_value,
+            "aggregate": self.aggregate.to_dict(),
+        }
 
 
 @dataclass
 class SeeSawReport:
-    """Full see-saw evaluation report across the precision sweep."""
+    """Full see-saw evaluation report across a control sweep."""
 
-    results: list[SeeSawResult]
+    model_label: str
+    points: list[SeeSawPointResult]
 
     @property
     def logic_variance(self) -> float:
-        """Variance of logical accuracy across EQ precision settings.
-
-        Low variance = CLSA hypothesis supported (logic is stable).
-        High variance = see-saw effect present.
-        """
-        scores = [r.logical_accuracy for r in self.results]
-        mean = sum(scores) / len(scores)
-        return sum((s - mean) ** 2 for s in scores) / len(scores)
+        return logic_variance_from_aggregates([point.aggregate for point in self.points])
 
     @property
     def eq_range(self) -> float:
-        """Range of emotional scores across the sweep."""
-        scores = [r.emotional_score for r in self.results]
-        return max(scores) - min(scores)
+        return eq_range_from_aggregates([point.aggregate for point in self.points])
+
+    def to_dict(self) -> dict:
+        return {
+            "model_label": self.model_label,
+            "points": [point.to_dict() for point in self.points],
+            "logic_variance": self.logic_variance,
+            "eq_range": self.eq_range,
+            "pass": self.logic_variance < 0.01,
+        }
 
     def summary(self) -> str:
-        lines = ["See-Saw Evaluation Report", "=" * 40]
-        for r in self.results:
+        lines = ["See-Saw Evaluation Report", "=" * 40, f"Model: {self.model_label}"]
+        for point in self.points:
+            agg = point.aggregate
             lines.append(
-                f"  pi_EQ={r.eq_precision:.1f} pi_L={r.logic_precision:.1f} "
-                f"| logic={r.logical_accuracy:.3f} "
-                f"| EQ={r.emotional_score:.3f} "
-                f"| combined={r.combined_score:.3f} "
-                f"| steps={r.deliberation_steps:.1f}"
+                f"  {point.control_name}={point.control_value}"
+                f" | logic={agg.logic.mean:.3f}"
+                f" [{agg.logic.ci_low:.3f}, {agg.logic.ci_high:.3f}]"
+                f" | EQ={agg.eq.mean:.3f}"
+                f" [{agg.eq.ci_low:.3f}, {agg.eq.ci_high:.3f}]"
+                f" | combined={agg.combined.mean:.3f}"
+                f" | hard_fail={agg.hard_fail_rate.mean:.3f}"
             )
-        lines.append(f"Logic accuracy variance: {self.logic_variance:.6f}")
+        lines.append(f"Logic score variance: {self.logic_variance:.6f}")
         lines.append(f"EQ score range: {self.eq_range:.3f}")
-        lines.append(
-            "PASS" if self.logic_variance < 0.01 else "FAIL (see-saw detected)"
-        )
+        lines.append("PASS" if self.logic_variance < 0.01 else "FAIL (see-saw detected)")
         return "\n".join(lines)
 
 
 class SeeSawEvaluator:
-    """Runs the core see-saw hypothesis test.
-
-    Sweeps pi_EQ across a range while holding pi_L constant, measuring
-    logical accuracy and emotional appropriateness independently at
-    each point.
-
-    Users must provide scoring functions for their specific domain.
-    """
+    """Judge-based shared-prompt see-saw evaluator."""
 
     def __init__(
         self,
-        model: CLSA,
-        logic_scorer: callable,
-        eq_scorer: callable,
-        device: str = "cpu",
+        benchmark: list[BenchmarkExample],
+        judge: OpenAIJudge,
+        generation_config: GenerationConfig,
+        bootstrap_samples: int = 1000,
+        bootstrap_seed: int = 0,
     ):
-        """
-        Args:
-            model: trained CLSA model to evaluate.
-            logic_scorer: function(logits, labels) -> float score in [0, 1].
-            eq_scorer: function(logits, labels) -> float score in [0, 1].
-            device: device for evaluation.
-        """
-        self.model = model.to(device)
-        self.logic_scorer = logic_scorer
-        self.eq_scorer = eq_scorer
-        self.device = device
-
-    @torch.no_grad()
-    def evaluate_point(
-        self,
-        dataloader: DataLoader,
-        eq_precision: float,
-        logic_precision: float,
-    ) -> SeeSawResult:
-        """Evaluate at a single precision setting."""
-        self.model.eval()
-
-        total_logic = 0.0
-        total_eq = 0.0
-        total_steps = 0.0
-        num_batches = 0
-
-        precision_overrides = {
-            ModuleType.EQ: eq_precision,
-            ModuleType.LOGIC: logic_precision,
-        }
-
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch.get("labels", input_ids).to(self.device)
-
-            output = self.model(
-                input_ids,
-                labels=labels,
-                precision_overrides=precision_overrides,
-            )
-
-            total_logic += self.logic_scorer(output["logits"], labels)
-            total_eq += self.eq_scorer(output["logits"], labels)
-            total_steps += output["deliberation"]["steps"]
-            num_batches += 1
-
-        n = max(num_batches, 1)
-        logic_acc = total_logic / n
-        eq_score = total_eq / n
-
-        return SeeSawResult(
-            eq_precision=eq_precision,
-            logic_precision=logic_precision,
-            logical_accuracy=logic_acc,
-            emotional_score=eq_score,
-            combined_score=logic_acc * eq_score,
-            deliberation_steps=total_steps / n,
-        )
+        self.benchmark = benchmark
+        self.benchmark_by_id = {example.id: example for example in benchmark}
+        self.judge = judge
+        self.generation_config = generation_config
+        self.bootstrap_samples = bootstrap_samples
+        self.bootstrap_seed = bootstrap_seed
 
     def run_sweep(
         self,
-        dataloader: DataLoader,
-        eq_precision_range: list[float] | None = None,
-        logic_precision: float = 1.0,
-    ) -> SeeSawReport:
-        """Run the full see-saw sweep.
+        generator: ResponseGenerator,
+        controls: list[GenerationControl],
+    ) -> tuple[SeeSawReport, list[GeneratedResponse], list[JudgeScore]]:
+        point_results: list[SeeSawPointResult] = []
+        all_responses: list[GeneratedResponse] = []
+        all_scores: list[JudgeScore] = []
 
-        Args:
-            dataloader: evaluation data requiring both logic and EQ.
-            eq_precision_range: list of pi_EQ values to test.
-                Defaults to [0.1, 0.5, 1.0, 2.0, 5.0, 10.0].
-            logic_precision: held constant throughout the sweep.
-
-        Returns:
-            SeeSawReport with results at each precision point.
-        """
-        if eq_precision_range is None:
-            eq_precision_range = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
-
-        results = []
-        for eq_pi in eq_precision_range:
-            logger.info("Evaluating pi_EQ=%.1f, pi_L=%.1f", eq_pi, logic_precision)
-            result = self.evaluate_point(dataloader, eq_pi, logic_precision)
-            results.append(result)
+        for offset, control in enumerate(controls):
             logger.info(
-                "  logic=%.3f eq=%.3f combined=%.3f",
-                result.logical_accuracy,
-                result.emotional_score,
-                result.combined_score,
+                "Running shared-benchmark sweep point %s=%s for %s",
+                control.name,
+                control.value,
+                generator.model_label,
             )
+            responses = generate_shared_benchmark(
+                generator, self.benchmark, control, self.generation_config
+            )
+            scores = self.judge.score_many(self.benchmark_by_id, responses)
+            aggregate = summarize_judge_scores(
+                scores,
+                bootstrap_samples=self.bootstrap_samples,
+                seed=self.bootstrap_seed + offset,
+            )
+            point_results.append(
+                SeeSawPointResult(
+                    control_name=control.name,
+                    control_value=control.value,
+                    aggregate=aggregate,
+                )
+            )
+            all_responses.extend(responses)
+            all_scores.extend(scores)
 
-        report = SeeSawReport(results=results)
+        report = SeeSawReport(model_label=generator.model_label, points=point_results)
         logger.info("\n%s", report.summary())
-        return report
+        return report, all_responses, all_scores
