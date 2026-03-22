@@ -11,8 +11,10 @@ Usage:
   uv run python scripts/train_baseline.py \\
       --model HuggingFaceTB/SmolLM2-360M --epochs 3 --device cuda
 
-The training loop mirrors Phase 1 (optimizer, LR, grad clipping, AMP) so
-the comparison is fair: same data, same training budget, same hyperparams.
+The training loop mirrors the CLSA optimization settings (optimizer, LR,
+grad clipping, AMP). Its data path now mirrors the current CLSA corpus
+format as well: structured Phase 1 prompt/target supervision plus the
+existing Phase 2/3 multi-faculty text corpus.
 """
 
 import argparse

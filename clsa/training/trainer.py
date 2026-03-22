@@ -7,10 +7,11 @@ Section 5.1: CLSA training follows three phases:
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -88,6 +89,72 @@ def unfreeze_module(module: nn.Module) -> None:
     """Unfreeze all parameters in a module."""
     for param in module.parameters():
         param.requires_grad = True
+
+
+def masked_causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy for causal LM training with prompt masking support."""
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
+
+
+@dataclass
+class ModuleSpecializationProbe:
+    """Phase 1 probe task used to retain module-specific competence in Phase 3."""
+
+    module_type: ModuleType
+    lm_head_weight: torch.Tensor
+    dataloader: DataLoader
+    name: str
+    _iterator: object | None = field(default=None, init=False, repr=False)
+
+    def next_batch(self) -> dict[str, torch.Tensor]:
+        if self._iterator is None:
+            self._iterator = iter(self.dataloader)
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            self._iterator = iter(self.dataloader)
+            return next(self._iterator)
+
+    def loss_on_model(self, model: CLSA, device: str) -> torch.Tensor:
+        batch = self.next_batch()
+        non_blocking = device == "cuda"
+        input_ids = batch["input_ids"].to(device, non_blocking=non_blocking)
+        labels = batch["labels"].to(device, non_blocking=non_blocking)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=non_blocking)
+
+        hidden_states = model.get_module(self.module_type).backbone(input_ids, attention_mask)
+        logits = F.linear(hidden_states, self.lm_head_weight.to(hidden_states.dtype))
+        return masked_causal_lm_loss(logits, labels)
+
+
+class Phase3SpecializationRetainer:
+    """Periodically probes modules on Phase 1 tasks during Phase 3."""
+
+    def __init__(
+        self,
+        probes: list[ModuleSpecializationProbe],
+        *,
+        interval: int = 4,
+        device: str = "cpu",
+    ):
+        self.probes = probes
+        self.interval = max(1, interval)
+        self.device = device
+        for probe in self.probes:
+            probe.lm_head_weight = probe.lm_head_weight.detach().to(device)
+
+    def maybe_compute(self, model: CLSA, step: int) -> torch.Tensor:
+        if not self.probes or step % self.interval != 0:
+            return torch.tensor(0.0, device=self.device)
+
+        losses = [probe.loss_on_model(model, self.device) for probe in self.probes]
+        return torch.stack(losses).mean()
 
 
 class Phase1Trainer:
@@ -329,13 +396,20 @@ class Phase3Trainer:
     """Phase 3: Guided fine-tuning with structural guardrails.
 
     All parameters are unfrozen and the system is fine-tuned end-to-end.
-    Auxiliary losses (orthogonality, specialization, diversity) prevent
-    module identity collapse.
+    In addition to the main CLSA loss, optional Phase 1 probe batches can be
+    replayed through each module backbone with frozen Phase 1 LM heads to
+    preserve module-specific competence.
     """
 
-    def __init__(self, model: CLSA, config: TrainingConfig):
+    def __init__(
+        self,
+        model: CLSA,
+        config: TrainingConfig,
+        specialization_retainer: Phase3SpecializationRetainer | None = None,
+    ):
         self.model = model.to(config.device)
         self.config = config
+        self.specialization_retainer = specialization_retainer
 
         # Unfreeze everything
         unfreeze_module(model)
@@ -349,11 +423,23 @@ class Phase3Trainer:
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Phase 3: all %d parameters trainable", total_params)
+        if self.specialization_retainer is not None:
+            logger.info(
+                "Phase 3 specialization retention enabled with %d module probes (interval=%d)",
+                len(self.specialization_retainer.probes),
+                self.specialization_retainer.interval,
+            )
 
     def train_epoch(self, dataloader: DataLoader) -> dict[str, float]:
         """Train for one epoch. Returns dict of average losses."""
         self.model.train()
-        totals = {"total": 0.0, "task": 0.0, "orthogonality": 0.0, "diversity": 0.0}
+        totals = {
+            "total": 0.0,
+            "task": 0.0,
+            "orthogonality": 0.0,
+            "specialization": 0.0,
+            "diversity": 0.0,
+        }
         num_batches = 0
         device = self.config.device
         non_blocking = device == "cuda"
@@ -368,7 +454,15 @@ class Phase3Trainer:
 
             with autocast(device, dtype=self.config.amp_dtype, enabled=self.config.use_amp):
                 output = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                loss = output["loss"]["total"]
+                specialization = torch.tensor(0.0, device=device)
+                if self.specialization_retainer is not None:
+                    specialization = self.specialization_retainer.maybe_compute(
+                        self.model, num_batches + 1
+                    )
+                loss = (
+                    output["loss"]["total"]
+                    + self.model.config.specialization_beta * specialization
+                )
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -378,17 +472,21 @@ class Phase3Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            for key in totals:
-                totals[key] += output["loss"][key].detach().item()
+            totals["total"] += loss.detach().item()
+            totals["task"] += output["loss"]["task"].detach().item()
+            totals["orthogonality"] += output["loss"]["orthogonality"].detach().item()
+            totals["specialization"] += specialization.detach().item()
+            totals["diversity"] += output["loss"]["diversity"].detach().item()
             num_batches += 1
 
             if num_batches % self.config.log_interval == 0:
                 pbar.set_postfix(
                     loss=f"{totals['total'] / num_batches:.4f}",
                     task=f"{totals['task'] / num_batches:.4f}",
+                    spec=f"{totals['specialization'] / num_batches:.4f}",
                 )
 
-            del input_ids, labels, attention_mask, output, loss
+            del input_ids, labels, attention_mask, output, specialization, loss
             if device == "mps":
                 clear_memory(device)
 

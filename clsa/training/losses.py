@@ -86,11 +86,12 @@ def specialization_loss(
     labels: torch.Tensor,
     baseline_accuracy: float,
 ) -> torch.Tensor:
-    """Penalize degradation from Phase 1 domain-specific performance.
+    """Legacy specialization helper based on baseline accuracy.
 
-    Section 5.4: Periodically probes each module on domain-specific
-    benchmarks and penalizes if accuracy drops below the Phase 1
-    baseline.
+    This function is retained as a simple reference implementation, but the
+    active Phase 3 specialization-retention path now lives in
+    `Phase3SpecializationRetainer` and uses differentiable Phase 1 probe loss
+    replay with frozen Phase 1 LM heads.
 
     This is a simplified version that compares current per-token
     accuracy against a stored baseline. The full implementation would

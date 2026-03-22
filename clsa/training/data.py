@@ -10,7 +10,10 @@ All builders return standard PyTorch DataLoaders yielding dicts with
 
 import json
 import logging
+import re
+from dataclasses import dataclass, field
 from functools import partial
+from typing import Any
 
 import torch
 from datasets import load_dataset
@@ -21,6 +24,18 @@ from transformers import PreTrainedTokenizer
 from clsa.config.clsa_config import ModuleType
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SupervisedTextExample:
+    """One prompt/target example for supervised causal-LM training."""
+
+    prompt: str
+    target: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def is_valid(self) -> bool:
+        return bool(self.prompt.strip() and self.target.strip())
 
 # Logic module datasets. Combined to produce a larger, more diverse
 # reasoning corpus (~70K examples total).
@@ -89,6 +104,87 @@ EQ_DATASETS = [
         "name": "split",
         "split": "train",
         "formatter": "_format_emotion_example",
+    },
+]
+
+# Structured Phase 1 supervision uses prompt/target examples with target-only
+# loss masking so modules learn to answer a task rather than merely continue a
+# preformatted record.
+PHASE1_LOGIC_SUPERVISED_DATASETS = [
+    {
+        "path": "allenai/ai2_arc",
+        "name": "ARC-Easy",
+        "split": "train",
+        "formatter": "_supervise_arc_example",
+    },
+    {
+        "path": "allenai/ai2_arc",
+        "name": "ARC-Challenge",
+        "split": "train",
+        "formatter": "_supervise_arc_example",
+    },
+    {
+        "path": "allenai/sciq",
+        "name": None,
+        "split": "train",
+        "formatter": "_supervise_sciq_example",
+    },
+    {
+        "path": "allenai/openbookqa",
+        "name": "main",
+        "split": "train",
+        "formatter": "_supervise_openbookqa_example",
+    },
+    {
+        "path": "Rowan/hellaswag",
+        "name": None,
+        "split": "train",
+        "formatter": "_supervise_hellaswag_example",
+    },
+    {
+        "path": "allenai/winogrande",
+        "name": "winogrande_debiased",
+        "split": "train",
+        "formatter": "_supervise_winogrande_example",
+    },
+]
+
+PHASE1_EQ_SUPERVISED_DATASETS = [
+    {
+        "path": "allenai/prosocial-dialog",
+        "name": "default",
+        "split": "train",
+        "formatter": "_supervise_prosocial_example",
+    },
+    {
+        "path": "Amod/mental_health_counseling_conversations",
+        "name": None,
+        "split": "train",
+        "formatter": "_supervise_counseling_example",
+    },
+    {
+        "path": "thu-coai/esconv",
+        "name": None,
+        "split": "train",
+        "formatter": "_supervise_esconv_example",
+    },
+    {
+        "path": "Anthropic/hh-rlhf",
+        "name": None,
+        "split": "train",
+        "formatter": "_supervise_hh_rlhf_example",
+    },
+    {
+        "path": "google-research-datasets/go_emotions",
+        "name": "simplified",
+        "split": "train",
+        "formatter": "_supervise_goemotions_example",
+    },
+    {
+        "path": "dair-ai/emotion",
+        "name": "split",
+        "split": "train",
+        "formatter": "_supervise_emotion_example",
     },
 ]
 
@@ -326,6 +422,250 @@ def _format_winogrande_example(example: dict) -> str:
     correct = option1 if answer == "1" else option2
     filled = sentence.replace("_", correct)
     return f"Sentence: {sentence}\nA) {option1} B) {option2}\nAnswer: {filled}"
+
+
+def _supervised_answer_target(answer: str) -> str:
+    answer = str(answer).strip()
+    return answer if answer.endswith((".", "!", "?")) else f"{answer}."
+
+
+def _emotion_assessment_target(labels: list[str]) -> str:
+    cleaned = [label.strip() for label in labels if label.strip()]
+    if not cleaned:
+        return "The message seems emotionally neutral."
+    if len(cleaned) == 1:
+        return f"The message primarily conveys {cleaned[0]}."
+    joined = ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+    return f"The message conveys {joined}."
+
+
+def _split_hh_rlhf_transcript(transcript: str) -> SupervisedTextExample | None:
+    text = transcript.strip()
+    marker_positions = [match.start() for match in re.finditer(r"(?:^|\n\n)Assistant:", text)]
+    if not marker_positions:
+        return None
+
+    marker_start = marker_positions[-1]
+    assistant_offset = text.find("Assistant:", marker_start)
+    prompt = text[: assistant_offset + len("Assistant:")].strip()
+    target = text[assistant_offset + len("Assistant:") :].strip()
+    if not prompt or not target:
+        return None
+    return SupervisedTextExample(prompt=prompt, target=target)
+
+
+def _supervise_arc_example(example: dict) -> SupervisedTextExample:
+    question = str(example["question"]).strip()
+    choices = example["choices"]
+    labels = choices["label"]
+    texts = choices["text"]
+    answer_key = str(example["answerKey"]).strip()
+
+    choice_lines = [f"{label}) {text}" for label, text in zip(labels, texts)]
+    answer_text = next(
+        (str(text).strip() for label, text in zip(labels, texts) if str(label).strip() == answer_key),
+        answer_key,
+    )
+    prompt = (
+        "You are the logic specialist. Solve the multiple-choice problem and answer concisely.\n\n"
+        f"Question: {question}\n"
+        "Choices:\n"
+        + "\n".join(choice_lines)
+        + "\n\nAnswer:"
+    )
+    return SupervisedTextExample(prompt=prompt, target=_supervised_answer_target(answer_text))
+
+
+def _supervise_sciq_example(example: dict) -> SupervisedTextExample:
+    question = str(example["question"]).strip()
+    support = str(example.get("support", "")).strip()
+    correct = str(example["correct_answer"]).strip()
+    distractors = [
+        str(example.get("distractor1", "")).strip(),
+        str(example.get("distractor2", "")).strip(),
+        str(example.get("distractor3", "")).strip(),
+    ]
+    choices = [correct] + [choice for choice in distractors if choice]
+    choice_lines = [f"{chr(65 + i)}) {choice}" for i, choice in enumerate(choices)]
+
+    parts = ["You are the logic specialist. Answer the science question correctly."]
+    if support:
+        parts.append(f"Context: {support}")
+    parts.append(f"Question: {question}")
+    parts.append("Choices:\n" + "\n".join(choice_lines))
+    parts.append("Answer:")
+    prompt = "\n\n".join(parts)
+    return SupervisedTextExample(prompt=prompt, target=_supervised_answer_target(correct))
+
+
+def _supervise_openbookqa_example(example: dict) -> SupervisedTextExample:
+    question = str(example["question_stem"]).strip()
+    choices = example["choices"]
+    labels = choices["label"]
+    texts = choices["text"]
+    answer_key = str(example["answerKey"]).strip()
+    fact = str(example.get("fact1", "")).strip()
+
+    choice_lines = [f"{label}) {text}" for label, text in zip(labels, texts)]
+    answer_text = next(
+        (str(text).strip() for label, text in zip(labels, texts) if str(label).strip() == answer_key),
+        answer_key,
+    )
+
+    parts = ["You are the logic specialist. Use the provided fact if it helps and answer concisely."]
+    if fact:
+        parts.append(f"Fact: {fact}")
+    parts.append(f"Question: {question}")
+    parts.append("Choices:\n" + "\n".join(choice_lines))
+    parts.append("Answer:")
+    prompt = "\n\n".join(parts)
+    return SupervisedTextExample(prompt=prompt, target=_supervised_answer_target(answer_text))
+
+
+def _supervise_hellaswag_example(example: dict) -> SupervisedTextExample:
+    ctx = str(example["ctx"]).strip()
+    endings = [str(ending).strip() for ending in example["endings"]]
+    label = int(example["label"])
+
+    choice_lines = [f"{chr(65 + i)}) {ending}" for i, ending in enumerate(endings)]
+    answer = endings[label]
+    prompt = (
+        "You are the logic specialist. Choose the best continuation and answer naturally.\n\n"
+        f"Context: {ctx}\n"
+        "Choices:\n"
+        + "\n".join(choice_lines)
+        + "\n\nBest continuation:"
+    )
+    return SupervisedTextExample(prompt=prompt, target=_supervised_answer_target(answer))
+
+
+def _supervise_winogrande_example(example: dict) -> SupervisedTextExample:
+    sentence = str(example["sentence"]).strip()
+    option1 = str(example["option1"]).strip()
+    option2 = str(example["option2"]).strip()
+    answer = str(example["answer"]).strip()
+
+    correct = option1 if answer == "1" else option2
+    prompt = (
+        "You are the logic specialist. Resolve the blank correctly.\n\n"
+        f"Sentence: {sentence}\n"
+        f"Options:\nA) {option1}\nB) {option2}\n\n"
+        "Completed sentence:"
+    )
+    return SupervisedTextExample(
+        prompt=prompt,
+        target=_supervised_answer_target(sentence.replace("_", correct)),
+    )
+
+
+def _supervise_hh_rlhf_example(example: dict) -> SupervisedTextExample | None:
+    return _split_hh_rlhf_transcript(str(example["chosen"]))
+
+
+def _supervise_goemotions_example(example: dict) -> SupervisedTextExample:
+    emotion_names = [
+        "admiration", "amusement", "anger", "annoyance", "approval",
+        "caring", "confusion", "curiosity", "desire", "disappointment",
+        "disapproval", "disgust", "embarrassment", "excitement", "fear",
+        "gratitude", "grief", "joy", "love", "nervousness", "optimism",
+        "pride", "realization", "relief", "remorse", "sadness", "surprise",
+        "neutral",
+    ]
+    text = str(example["text"]).strip()
+    label_ids = example["labels"]
+    labels = [emotion_names[i] for i in label_ids if i < len(emotion_names)]
+    prompt = (
+        "You are the EQ specialist. Identify the emotions expressed in the message so a"
+        " supportive response can be calibrated well.\n\n"
+        f"Message: {text}\n\n"
+        "Emotion assessment:"
+    )
+    return SupervisedTextExample(prompt=prompt, target=_emotion_assessment_target(labels))
+
+
+def _supervise_emotion_example(example: dict) -> SupervisedTextExample:
+    emotion_names = ["sadness", "joy", "love", "anger", "fear", "surprise"]
+    text = str(example["text"]).strip()
+    label = int(example["label"])
+    emotion = emotion_names[label] if label < len(emotion_names) else "unknown"
+    prompt = (
+        "You are the EQ specialist. Identify the primary emotion in the message.\n\n"
+        f"Message: {text}\n\n"
+        "Emotion assessment:"
+    )
+    return SupervisedTextExample(prompt=prompt, target=_emotion_assessment_target([emotion]))
+
+
+def _supervise_prosocial_example(example: dict) -> SupervisedTextExample:
+    context = str(example.get("context", "")).strip()
+    response = str(example.get("response", "")).strip()
+    rots = [str(rot).strip() for rot in example.get("rots", []) if str(rot).strip()]
+
+    parts = [
+        "You are the EQ specialist. Write a prosocial, emotionally attuned response.",
+        f"Message: {context}",
+    ]
+    if rots:
+        parts.append("Considerations: " + " ".join(rots))
+    parts.append("Response:")
+    prompt = "\n\n".join(parts)
+    return SupervisedTextExample(prompt=prompt, target=response)
+
+
+def _supervise_counseling_example(example: dict) -> SupervisedTextExample:
+    context = str(example.get("Context", "")).strip()
+    response = str(example.get("Response", "")).strip()
+    prompt = (
+        "You are the EQ specialist. Write a supportive counselor response.\n\n"
+        f"Client: {context}\n\n"
+        "Counselor:"
+    )
+    return SupervisedTextExample(prompt=prompt, target=response)
+
+
+def _supervise_esconv_example(example: dict) -> list[SupervisedTextExample]:
+    data = json.loads(example["text"])
+    situation = str(data.get("situation", "")).strip()
+    emotion = str(data.get("emotion_type", "")).strip()
+    problem = str(data.get("problem_type", "")).strip()
+    dialog = data.get("dialog", [])
+
+    rendered_turns: list[str] = []
+    supervised_examples: list[SupervisedTextExample] = []
+    for turn in dialog:
+        speaker = "Seeker" if turn.get("speaker") == "usr" else "Supporter"
+        text = str(turn.get("text", "")).strip()
+        strategy = str(turn.get("strategy", "")).strip()
+        if not text:
+            continue
+
+        if speaker == "Supporter":
+            prompt_parts = [
+                "You are the EQ specialist. Continue the conversation with a supportive response."
+            ]
+            if emotion or problem:
+                prompt_parts.append(
+                    "Context: "
+                    + ", ".join(part for part in [emotion, problem] if part)
+                )
+            if situation:
+                prompt_parts.append(f"Situation: {situation}")
+            if rendered_turns:
+                prompt_parts.append("Conversation so far:\n" + "\n".join(rendered_turns))
+            if strategy:
+                prompt_parts.append(f"Support strategy: {strategy}")
+            prompt_parts.append("Supporter:")
+            supervised_examples.append(
+                SupervisedTextExample(
+                    prompt="\n\n".join(prompt_parts),
+                    target=text,
+                    metadata={"strategy": strategy},
+                )
+            )
+
+        rendered_turns.append(f"{speaker}: {text}")
+
+    return supervised_examples
 
 
 def _format_hh_rlhf_example(example: dict) -> str:
@@ -600,6 +940,20 @@ _FORMATTERS = {
     "_format_persuasion_example": _format_persuasion_example,
 }
 
+_SUPERVISED_FORMATTERS = {
+    "_supervise_arc_example": _supervise_arc_example,
+    "_supervise_sciq_example": _supervise_sciq_example,
+    "_supervise_openbookqa_example": _supervise_openbookqa_example,
+    "_supervise_hellaswag_example": _supervise_hellaswag_example,
+    "_supervise_winogrande_example": _supervise_winogrande_example,
+    "_supervise_hh_rlhf_example": _supervise_hh_rlhf_example,
+    "_supervise_goemotions_example": _supervise_goemotions_example,
+    "_supervise_emotion_example": _supervise_emotion_example,
+    "_supervise_prosocial_example": _supervise_prosocial_example,
+    "_supervise_counseling_example": _supervise_counseling_example,
+    "_supervise_esconv_example": _supervise_esconv_example,
+}
+
 
 
 def _tokenize_texts(
@@ -629,6 +983,94 @@ def _tokenize_texts(
             ids = torch.tensor(ids_list, dtype=torch.long)
             examples.append({"input_ids": ids, "labels": ids.clone()})
     return examples
+
+
+def _pack_supervised_token_ids(
+    prompt_ids: list[int],
+    target_ids: list[int],
+    *,
+    max_length: int,
+    eos_token_id: int | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Pack prompt/target tokens into a masked causal-LM example.
+
+    Prompt tokens are included in `input_ids` but masked out in `labels`.
+    When truncation is needed, the target is preserved preferentially and the
+    prompt is cropped from the left to keep the most relevant trailing context.
+    """
+    if not prompt_ids or not target_ids:
+        return None
+
+    extra_tokens = 1 if eos_token_id is not None else 0
+    target_budget = max_length - extra_tokens
+    if target_budget <= 0:
+        return None
+
+    trimmed_target_ids = target_ids[:target_budget]
+    if not trimmed_target_ids:
+        return None
+
+    prompt_budget = max_length - len(trimmed_target_ids) - extra_tokens
+    trimmed_prompt_ids = prompt_ids[-max(prompt_budget, 0):] if prompt_budget > 0 else []
+
+    input_ids = list(trimmed_prompt_ids) + list(trimmed_target_ids)
+    labels = ([-100] * len(trimmed_prompt_ids)) + list(trimmed_target_ids)
+    if eos_token_id is not None and len(input_ids) < max_length:
+        input_ids.append(eos_token_id)
+        labels.append(eos_token_id)
+
+    if not any(label != -100 for label in labels):
+        return None
+
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(labels, dtype=torch.long),
+    )
+
+
+def _tokenize_supervised_texts(
+    examples: list[SupervisedTextExample],
+    tokenizer: PreTrainedTokenizer,
+    max_length: int,
+    batch_size: int = 512,
+) -> list[dict[str, torch.Tensor]]:
+    """Tokenize supervised prompt/target examples with target-only loss."""
+    tokenized_examples = []
+    eos_token_id = tokenizer.eos_token_id
+
+    for i in tqdm(range(0, len(examples), batch_size), desc="Tokenizing"):
+        chunk = examples[i : i + batch_size]
+        prompts = [example.prompt for example in chunk]
+        targets = [example.target for example in chunk]
+
+        prompt_batch = tokenizer(
+            prompts,
+            add_special_tokens=True,
+            truncation=False,
+            padding=False,
+            return_attention_mask=False,
+        )
+        target_batch = tokenizer(
+            targets,
+            add_special_tokens=False,
+            truncation=False,
+            padding=False,
+            return_attention_mask=False,
+        )
+
+        for prompt_ids, target_ids in zip(prompt_batch["input_ids"], target_batch["input_ids"]):
+            packed = _pack_supervised_token_ids(
+                prompt_ids,
+                target_ids,
+                max_length=max_length,
+                eos_token_id=eos_token_id,
+            )
+            if packed is None:
+                continue
+            input_ids, labels = packed
+            tokenized_examples.append({"input_ids": input_ids, "labels": labels})
+
+    return tokenized_examples
 
 
 def _load_and_format_datasets(
@@ -675,6 +1117,40 @@ def _load_and_format_datasets(
     return texts
 
 
+def _load_and_format_supervised_datasets(
+    dataset_configs: list[dict],
+    max_samples: int | None = None,
+) -> list[SupervisedTextExample]:
+    """Load multiple datasets and convert them into prompt/target examples."""
+    raw_datasets = []
+    for cfg in dataset_configs:
+        logger.info("Loading dataset: %s (%s)", cfg["path"], cfg.get("name"))
+        ds = load_dataset(cfg["path"], cfg.get("name"), split=cfg["split"])
+        raw_datasets.append((ds, cfg["formatter"]))
+
+    total_available = sum(len(ds) for ds, _ in raw_datasets)
+    supervised_examples: list[SupervisedTextExample] = []
+
+    for ds, formatter_name in raw_datasets:
+        formatter = _SUPERVISED_FORMATTERS[formatter_name]
+
+        if max_samples is not None:
+            cap = max(1, int(max_samples * len(ds) / total_available))
+            ds = ds.select(range(min(cap, len(ds))))
+
+        logger.info("Formatting %d examples with %s", len(ds), formatter_name)
+        for record in ds:
+            formatted = formatter(record)
+            if formatted is None:
+                continue
+            if isinstance(formatted, list):
+                supervised_examples.extend(example for example in formatted if example.is_valid())
+            elif formatted.is_valid():
+                supervised_examples.append(formatted)
+
+    return supervised_examples
+
+
 def build_phase1_dataloader(
     module_type: ModuleType,
     tokenizer: PreTrainedTokenizer,
@@ -685,9 +1161,13 @@ def build_phase1_dataloader(
 ) -> DataLoader:
     """Build a DataLoader for Phase 1 module-specific pre-training.
 
-    For LOGIC, combines ARC (Easy + Challenge), SciQ, PIQA, HellaSwag,
-    and WinoGrande into a single ~70K example reasoning corpus.
-    For EQ, uses ProsocialDialog (~58K examples).
+    Phase 1 now uses structured prompt/target supervision with target-only
+    loss masking. This teaches each module to answer a task from a prompt
+    rather than simply continue an already-completed record.
+
+    LOGIC uses reasoning QA / completion datasets.
+    EQ uses empathetic response datasets plus emotion-recognition tasks
+    framed as prompt/target supervision.
 
     Args:
         module_type: which module to load data for (LOGIC or EQ).
@@ -702,20 +1182,20 @@ def build_phase1_dataloader(
         DataLoader yielding {"input_ids": ..., "labels": ...} dicts.
     """
     if module_type == ModuleType.LOGIC:
-        dataset_configs = LOGIC_DATASETS
+        dataset_configs = PHASE1_LOGIC_SUPERVISED_DATASETS
     elif module_type == ModuleType.EQ:
-        dataset_configs = EQ_DATASETS
+        dataset_configs = PHASE1_EQ_SUPERVISED_DATASETS
     else:
         raise ValueError(f"Phase 1 data not configured for {module_type}")
 
-    texts = _load_and_format_datasets(dataset_configs, max_samples)
+    supervised_examples = _load_and_format_supervised_datasets(dataset_configs, max_samples)
     logger.info(
-        "Phase 1 [%s]: %d total examples across %d datasets",
-        module_type.value, len(texts), len(dataset_configs),
+        "Phase 1 [%s]: %d prompt/target examples across %d datasets",
+        module_type.value, len(supervised_examples), len(dataset_configs),
     )
 
-    logger.info("Tokenizing %d examples (max_length=%d)", len(texts), max_length)
-    examples = _tokenize_texts(texts, tokenizer, max_length)
+    logger.info("Tokenizing %d examples (max_length=%d)", len(supervised_examples), max_length)
+    examples = _tokenize_supervised_texts(supervised_examples, tokenizer, max_length)
     logger.info("Produced %d tokenized examples", len(examples))
 
     dataset = TokenizedDataset(examples)
@@ -867,10 +1347,15 @@ def build_combined_dataloader(
 ) -> DataLoader:
     """Build a DataLoader combining ALL training data for baseline fine-tuning.
 
-    Merges Logic (~70K), EQ (~180K), and Phase 2 multi-faculty (~30K) training
-    splits into a single corpus (~280K examples). This ensures the monolithic
-    baseline sees exactly the same data that CLSA saw across all three phases,
-    making the comparison fair.
+    Merges the current CLSA training corpora into a single monolithic baseline
+    dataloader:
+    - Phase 1 logic prompt/target supervision with target-only masking
+    - Phase 1 EQ prompt/target supervision with target-only masking
+    - Phase 2/3 multi-faculty text corpora using the existing whole-sequence
+      causal-LM objective
+
+    This keeps the baseline aligned with the current CLSA data design without
+    forcing the baseline into the same phased optimization schedule.
 
     Args:
         tokenizer: the tokenizer to use.
@@ -882,26 +1367,38 @@ def build_combined_dataloader(
     Returns:
         DataLoader yielding {"input_ids": ..., "labels": ...} dicts.
     """
-    all_standard = []
-    for cfg in LOGIC_DATASETS + EQ_DATASETS:
-        all_standard.append(cfg)
-    for cfg in PHASE2_DATASETS:
-        if cfg["formatter"] != "_format_persuasion_example":
-            all_standard.append(cfg)
-
+    phase1_configs = PHASE1_LOGIC_SUPERVISED_DATASETS + PHASE1_EQ_SUPERVISED_DATASETS
+    phase2_standard_configs = [
+        cfg for cfg in PHASE2_DATASETS if cfg["formatter"] != "_format_persuasion_example"
+    ]
     persuasion_config = next(
-        (cfg for cfg in PHASE2_DATASETS
-         if cfg["formatter"] == "_format_persuasion_example"),
+        (cfg for cfg in PHASE2_DATASETS if cfg["formatter"] == "_format_persuasion_example"),
         None,
     )
 
-    raw_datasets = []
-    for cfg in all_standard:
+    sources = []
+    for cfg in phase1_configs:
         logger.info("Loading dataset: %s (%s)", cfg["path"], cfg.get("name"))
         ds = load_dataset(cfg["path"], cfg.get("name"), split=cfg["split"])
-        raw_datasets.append((ds, cfg["formatter"]))
+        sources.append(
+            {
+                "kind": "supervised",
+                "dataset": ds,
+                "formatter_name": cfg["formatter"],
+            }
+        )
 
-    persuasion_texts = []
+    for cfg in phase2_standard_configs:
+        logger.info("Loading dataset: %s (%s)", cfg["path"], cfg.get("name"))
+        ds = load_dataset(cfg["path"], cfg.get("name"), split=cfg["split"])
+        sources.append(
+            {
+                "kind": "text",
+                "dataset": ds,
+                "formatter_name": cfg["formatter"],
+            }
+        )
+
     if persuasion_config is not None:
         logger.info(
             "Loading dataset: %s (grouping utterances into dialogues)",
@@ -913,32 +1410,60 @@ def build_combined_dataloader(
             split=persuasion_config["split"],
         )
         persuasion_texts = _build_persuasion_dialogues(persuasion_ds)
+        sources.append(
+            {
+                "kind": "text_list",
+                "dataset": persuasion_texts,
+                "formatter_name": "_format_persuasion_example",
+            }
+        )
 
-    standard_total = sum(len(ds) for ds, _ in raw_datasets)
-    persuasion_total = len(persuasion_texts)
-    grand_total = standard_total + persuasion_total
+    total_available = sum(len(source["dataset"]) for source in sources)
+    supervised_examples: list[SupervisedTextExample] = []
+    texts: list[str] = []
 
-    texts = []
-    for ds, formatter_name in raw_datasets:
-        formatter = _FORMATTERS[formatter_name]
+    for source in sources:
+        dataset = source["dataset"]
         if max_samples is not None:
-            cap = max(1, int(max_samples * len(ds) / grand_total))
-            cap = min(cap, len(ds))
-            ds = ds.select(range(cap))
-        logger.info("Formatting %d examples with %s", len(ds), formatter_name)
-        formatted = [formatter(ex) for ex in ds]
-        texts.extend(t for t in formatted if t)
+            cap = max(1, int(max_samples * len(dataset) / total_available))
+            cap = min(cap, len(dataset))
+        else:
+            cap = len(dataset)
 
-    if persuasion_texts:
-        if max_samples is not None:
-            cap = max(1, int(max_samples * persuasion_total / grand_total))
-            cap = min(cap, len(persuasion_texts))
-            persuasion_texts = persuasion_texts[:cap]
-        texts.extend(persuasion_texts)
+        if source["kind"] == "supervised":
+            formatter = _SUPERVISED_FORMATTERS[source["formatter_name"]]
+            dataset = dataset.select(range(cap))
+            logger.info("Formatting %d examples with %s", len(dataset), source["formatter_name"])
+            for record in dataset:
+                formatted = formatter(record)
+                if formatted is None:
+                    continue
+                if isinstance(formatted, list):
+                    supervised_examples.extend(example for example in formatted if example.is_valid())
+                elif formatted.is_valid():
+                    supervised_examples.append(formatted)
+            continue
 
-    logger.info("Combined baseline: %d total examples", len(texts))
+        if source["kind"] == "text":
+            formatter = _FORMATTERS[source["formatter_name"]]
+            dataset = dataset.select(range(cap))
+            logger.info("Formatting %d examples with %s", len(dataset), source["formatter_name"])
+            formatted = [formatter(ex) for ex in dataset]
+            texts.extend(text for text in formatted if text)
+            continue
 
-    examples = _tokenize_texts(texts, tokenizer, max_length)
+        # text_list
+        logger.info("Adding %d/%d persuasion dialogues", cap, len(dataset))
+        texts.extend(dataset[:cap])
+
+    logger.info(
+        "Combined baseline: %d supervised examples and %d text examples",
+        len(supervised_examples),
+        len(texts),
+    )
+
+    examples = _tokenize_supervised_texts(supervised_examples, tokenizer, max_length)
+    examples.extend(_tokenize_texts(texts, tokenizer, max_length))
     logger.info("Produced %d tokenized examples", len(examples))
 
     dataset = TokenizedDataset(examples)

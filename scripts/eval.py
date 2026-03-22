@@ -54,7 +54,7 @@ from clsa.evaluation.stats import (
 )
 from clsa.model import CLSA
 from clsa.modules.transformer import TransformerForCausalLM
-from clsa.training.checkpointing import load_checkpoint
+from clsa.training.checkpointing import extract_phase1_backbone_state, load_checkpoint
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,7 +76,7 @@ def load_shared_tokenizer(model_id: str = MODEL_ID):
 
 def load_clsa_model(checkpoint_path: str, device: str) -> CLSA:
     model = CLSA(CLSAConfig())
-    load_checkpoint(model, checkpoint_path, strict=False)
+    load_checkpoint(model, checkpoint_path, strict=True)
     model = model.to(device)
     model.eval()
     return model
@@ -84,10 +84,8 @@ def load_clsa_model(checkpoint_path: str, device: str) -> CLSA:
 
 def load_phase1_as_causal_lm(backbone_path: str, device: str) -> TransformerForCausalLM:
     model = TransformerForCausalLM(TransformerConfig())
-    checkpoint = torch.load(backbone_path, map_location="cpu", weights_only=True)
-    state = checkpoint["model_state_dict"]
-    causal_state = {f"model.{k}": v for k, v in state.items()}
-    model.load_state_dict(causal_state, strict=False)
+    backbone_state = extract_phase1_backbone_state(backbone_path)
+    model.model.load_state_dict(backbone_state, strict=True)
     model = model.to(device)
     model.eval()
     return model

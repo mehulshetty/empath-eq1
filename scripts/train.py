@@ -46,6 +46,7 @@ from clsa.modules.weight_loading import (
     load_smollm2_into_transformer,
 )
 from clsa.training.checkpointing import (
+    extract_phase1_lm_head_weight,
     load_checkpoint,
     load_phase1_backbones_into_clsa,
     load_training_state,
@@ -54,9 +55,11 @@ from clsa.training.checkpointing import (
 )
 from clsa.training.data import build_phase1_dataloader, build_phase2_dataloader
 from clsa.training.trainer import (
+    ModuleSpecializationProbe,
     Phase1Trainer,
     Phase2Trainer,
     Phase3Trainer,
+    Phase3SpecializationRetainer,
     TrainingConfig,
 )
 
@@ -149,7 +152,20 @@ def run_phase1(args: argparse.Namespace) -> None:
         start_epoch=start_epoch,
     )
 
-    # Save backbone checkpoint (strips the LM head)
+    # Save a full LM reference checkpoint for later specialization probes.
+    lm_output_path = Path(args.output_dir) / f"phase1_{module_type.value}_lm.pt"
+    save_checkpoint(
+        model,
+        lm_output_path,
+        metadata={
+            "phase": 1,
+            "module": module_type.value,
+            "epochs": args.epochs,
+            "artifact": "full_lm_reference",
+        },
+    )
+
+    # Save backbone checkpoint (strips the LM head) for Phase 2 transfer.
     output_path = Path(args.output_dir) / f"phase1_{module_type.value}.pt"
     save_phase1_backbone(
         model,
@@ -158,9 +174,14 @@ def run_phase1(args: argparse.Namespace) -> None:
             "phase": 1,
             "module": module_type.value,
             "epochs": args.epochs,
+            "artifact": "backbone",
         },
     )
-    logger.info("Phase 1 complete. Backbone saved to %s", output_path)
+    logger.info(
+        "Phase 1 complete. LM reference saved to %s and backbone saved to %s",
+        lm_output_path,
+        output_path,
+    )
 
 
 # -- Phase 2 ------------------------------------------------------------------
@@ -194,11 +215,24 @@ def run_phase2(args: argparse.Namespace) -> None:
     if args.eq_checkpoint:
         backbone_paths[ModuleType.EQ] = args.eq_checkpoint
 
+    model_dir = None
     if backbone_paths:
         load_phase1_backbones_into_clsa(model, backbone_paths)
+        logger.info(
+            "Initializing remaining CLSA backbones from pretrained %s",
+            MODEL_ID,
+        )
+        model_dir = download_smollm2_weights(MODEL_ID)
+        for mt_str in model.modules_dict:
+            module_type = ModuleType(mt_str)
+            if module_type in backbone_paths:
+                continue
+            module = model.modules_dict[mt_str]
+            load_smollm2_into_transformer(module.backbone, model_dir)
+        load_smollm2_into_transformer(model.decoder.backbone, model_dir)
     else:
-        # No Phase 1 checkpoints provided: initialize from pretrained SmolLM2
-        logger.info("No Phase 1 checkpoints provided, using pretrained SmolLM2")
+        # No Phase 1 checkpoints provided: initialize all backbones from pretrained SmolLM2
+        logger.info("No Phase 1 checkpoints provided, using pretrained %s", MODEL_ID)
         model_dir = download_smollm2_weights(MODEL_ID)
         for mt_str in model.modules_dict:
             module = model.modules_dict[mt_str]
@@ -245,7 +279,9 @@ def run_phase3(args: argparse.Namespace) -> None:
     """Phase 3: End-to-end fine-tuning with structural guardrails.
 
     Loads a Phase 2 CLSA checkpoint and fine-tunes all parameters
-    with orthogonality, specialization, and diversity losses.
+    with orthogonality and diversity losses, plus optional replay of
+    Phase 1 probe batches through frozen Phase 1 LM heads to retain
+    module-specific competence.
     """
     tokenizer = load_tokenizer()
 
@@ -263,9 +299,85 @@ def run_phase3(args: argparse.Namespace) -> None:
     model = CLSA(clsa_config)
 
     if args.checkpoint:
-        load_checkpoint(model, args.checkpoint, strict=False)
+        load_checkpoint(model, args.checkpoint, strict=True)
     else:
         logger.warning("No Phase 2 checkpoint provided, training from scratch")
+
+    def resolve_probe_checkpoint(explicit_path: str | None, module_name: str) -> str | None:
+        if explicit_path:
+            return explicit_path
+
+        candidate_dirs = []
+        if args.checkpoint:
+            candidate_dirs.append(Path(args.checkpoint).resolve().parent)
+        candidate_dirs.append(Path(args.output_dir).resolve())
+
+        for directory in candidate_dirs:
+            candidate = directory / f"phase1_{module_name}_lm.pt"
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    logic_probe_checkpoint = resolve_probe_checkpoint(args.logic_probe_checkpoint, "logic")
+    eq_probe_checkpoint = resolve_probe_checkpoint(args.eq_probe_checkpoint, "eq")
+
+    specialization_retainer = None
+    if logic_probe_checkpoint or eq_probe_checkpoint:
+        if not logic_probe_checkpoint or not eq_probe_checkpoint:
+            raise ValueError(
+                "Specialization retention requires both logic and EQ Phase 1 LM checkpoints. "
+                "Provide --logic-probe-checkpoint and --eq-probe-checkpoint, or place "
+                "`phase1_logic_lm.pt` and `phase1_eq_lm.pt` alongside the Phase 2/3 checkpoints."
+            )
+
+        probe_batch_size = args.specialization_probe_batch_size or args.batch_size
+        probe_samples = args.specialization_probe_samples
+        logger.info(
+            "Building specialization probe dataloaders (batch_size=%d, samples=%s)",
+            probe_batch_size,
+            probe_samples,
+        )
+
+        logic_probe_loader = build_phase1_dataloader(
+            module_type=ModuleType.LOGIC,
+            tokenizer=tokenizer,
+            batch_size=probe_batch_size,
+            max_length=args.max_length,
+            max_samples=probe_samples,
+            num_workers=args.num_workers,
+        )
+        eq_probe_loader = build_phase1_dataloader(
+            module_type=ModuleType.EQ,
+            tokenizer=tokenizer,
+            batch_size=probe_batch_size,
+            max_length=args.max_length,
+            max_samples=probe_samples,
+            num_workers=args.num_workers,
+        )
+
+        specialization_retainer = Phase3SpecializationRetainer(
+            probes=[
+                ModuleSpecializationProbe(
+                    module_type=ModuleType.LOGIC,
+                    lm_head_weight=extract_phase1_lm_head_weight(logic_probe_checkpoint),
+                    dataloader=logic_probe_loader,
+                    name="logic",
+                ),
+                ModuleSpecializationProbe(
+                    module_type=ModuleType.EQ,
+                    lm_head_weight=extract_phase1_lm_head_weight(eq_probe_checkpoint),
+                    dataloader=eq_probe_loader,
+                    name="eq",
+                ),
+            ],
+            interval=args.specialization_probe_interval,
+            device=args.device,
+        )
+    else:
+        logger.warning(
+            "Phase 3 specialization retention is disabled because no Phase 1 LM probe checkpoints "
+            "were found. Provide --logic-probe-checkpoint and --eq-probe-checkpoint to enable it."
+        )
 
     # Configure training
     training_config = TrainingConfig(
@@ -277,7 +389,11 @@ def run_phase3(args: argparse.Namespace) -> None:
     )
 
     # Train
-    trainer = Phase3Trainer(model, training_config)
+    trainer = Phase3Trainer(
+        model,
+        training_config,
+        specialization_retainer=specialization_retainer,
+    )
 
     start_epoch = 0
     if args.resume:
@@ -331,6 +447,16 @@ def main():
     p3 = subparsers.add_parser("phase3", help="End-to-end fine-tuning")
     p3.add_argument("--checkpoint", default=None,
                      help="Path to Phase 2 CLSA checkpoint")
+    p3.add_argument("--logic-probe-checkpoint", default=None,
+                     help="Path to the full Phase 1 logic LM checkpoint used for specialization probes")
+    p3.add_argument("--eq-probe-checkpoint", default=None,
+                     help="Path to the full Phase 1 EQ LM checkpoint used for specialization probes")
+    p3.add_argument("--specialization-probe-samples", type=int, default=2048,
+                     help="Phase 1 probe samples per module for specialization retention")
+    p3.add_argument("--specialization-probe-batch-size", type=int, default=None,
+                     help="Batch size for specialization probe batches (defaults to --batch-size)")
+    p3.add_argument("--specialization-probe-interval", type=int, default=4,
+                     help="Apply specialization probe loss every N Phase 3 batches")
     p3.add_argument("--epochs", type=int, default=3)
     add_common_args(p3)
 

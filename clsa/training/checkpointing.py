@@ -22,6 +22,65 @@ from clsa.model import CLSA
 logger = logging.getLogger(__name__)
 
 
+def extract_phase1_backbone_state(path: str | Path) -> dict[str, torch.Tensor]:
+    """Return bare Transformer backbone weights from a Phase 1 checkpoint.
+
+    Supports both:
+    - stripped backbone checkpoints saved by `save_phase1_backbone()`
+    - full causal-LM/training-state checkpoints containing `model.*` keys
+    """
+    path = Path(path)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    state_dict = checkpoint["model_state_dict"]
+    if not state_dict:
+        raise ValueError(f"Checkpoint {path} has an empty model_state_dict")
+
+    if any(key.startswith("embed_tokens.") for key in state_dict):
+        return state_dict
+
+    backbone_state = {}
+    for key, value in state_dict.items():
+        if key.startswith("model."):
+            backbone_state[key[len("model."):]] = value
+
+    if backbone_state:
+        logger.info(
+            "Interpreting %s as a full causal-LM/training checkpoint and extracting backbone weights",
+            path,
+        )
+        return backbone_state
+
+    sample_keys = sorted(state_dict)[:5]
+    raise ValueError(
+        f"Checkpoint {path} is not a recognized Phase 1 checkpoint format. "
+        f"Sample keys: {sample_keys}"
+    )
+
+
+def extract_phase1_lm_head_weight(path: str | Path) -> torch.Tensor:
+    """Return the LM-head weight tensor from a full Phase 1 LM checkpoint."""
+    path = Path(path)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    state_dict = checkpoint["model_state_dict"]
+
+    lm_head_weight = state_dict.get("lm_head.weight")
+    if lm_head_weight is not None:
+        return lm_head_weight
+
+    if "model.embed_tokens.weight" in state_dict:
+        logger.info(
+            "Using model.embed_tokens.weight as LM head for tied-weights checkpoint %s",
+            path,
+        )
+        return state_dict["model.embed_tokens.weight"]
+
+    sample_keys = sorted(state_dict)[:5]
+    raise ValueError(
+        f"Checkpoint {path} does not contain a usable Phase 1 LM head. "
+        f"Sample keys: {sample_keys}"
+    )
+
+
 def save_checkpoint(
     model: nn.Module,
     path: str | Path,
@@ -204,24 +263,10 @@ def load_phase1_backbones_into_clsa(
                 f"Phase 1 backbone checkpoint not found: {path}"
             )
 
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        state_dict = checkpoint["model_state_dict"]
+        state_dict = extract_phase1_backbone_state(path)
 
         module = clsa_model.get_module(module_type)
-        missing, unexpected = module.backbone.load_state_dict(
-            state_dict, strict=False
-        )
-
-        if missing:
-            logger.warning(
-                "Missing keys loading %s backbone from %s: %s",
-                module_type.value, path, missing,
-            )
-        if unexpected:
-            logger.warning(
-                "Unexpected keys loading %s backbone from %s: %s",
-                module_type.value, path, unexpected,
-            )
+        module.backbone.load_state_dict(state_dict, strict=True)
 
         logger.info(
             "Loaded Phase 1 %s backbone from %s (%d parameters)",
