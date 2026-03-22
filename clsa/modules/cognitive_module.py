@@ -24,15 +24,16 @@ class ProbabilisticHead(nn.Module):
     a mean vector and a log-variance vector parameterizing a diagonal
     Gaussian over the latent space.
 
-    Using log-variance (instead of raw variance) ensures numerical
-    stability and allows the network to output any real number, which
-    is then exponentiated to get a positive variance.
+    Log-variance is bounded via tanh scaling to [-logvar_range, +logvar_range].
+    This makes the Gaussian pathway inherently stable: downstream operations
+    like exp(-logvar) can never overflow regardless of training dynamics.
     """
 
-    def __init__(self, hidden_size: int, latent_dim: int):
+    def __init__(self, hidden_size: int, latent_dim: int, logvar_range: float = 4.0):
         super().__init__()
         self.mu_proj = nn.Linear(hidden_size, latent_dim)
         self.logvar_proj = nn.Linear(hidden_size, latent_dim)
+        self.logvar_range = logvar_range
 
         # Initialize log-variance projection to output near-zero values,
         # so initial variance is close to 1.0 (exp(0) = 1).
@@ -49,10 +50,11 @@ class ProbabilisticHead(nn.Module):
 
         Returns:
             mu: (batch, seq_len, latent_dim) mean of the distribution.
-            logvar: (batch, seq_len, latent_dim) log-variance.
+            logvar: (batch, seq_len, latent_dim) log-variance in
+                [-logvar_range, +logvar_range].
         """
         mu = self.mu_proj(hidden_states)
-        logvar = self.logvar_proj(hidden_states)
+        logvar = self.logvar_range * torch.tanh(self.logvar_proj(hidden_states))
         return mu, logvar
 
 
@@ -86,12 +88,20 @@ class CognitiveModule(nn.Module):
 
         # Probabilistic output head
         self.prob_head = ProbabilisticHead(
-            config.transformer.hidden_size, config.latent_dim
+            config.transformer.hidden_size, config.latent_dim,
+            logvar_range=config.logvar_range,
         )
 
         # Learnable precision weight for this module (the "dial").
-        # Stored as log-precision so the actual precision is always positive.
-        self.log_precision = nn.Parameter(torch.tensor(0.0))
+        # Stored as raw parameter, bounded via tanh before exponentiation
+        # to keep precision in [exp(-range), exp(+range)].
+        self._log_precision_raw = nn.Parameter(torch.tensor(0.0))
+        self._log_precision_range = config.log_precision_range
+
+    @property
+    def log_precision(self) -> torch.Tensor:
+        """Bounded log-precision value."""
+        return self._log_precision_range * torch.tanh(self._log_precision_raw)
 
     @property
     def precision(self) -> torch.Tensor:

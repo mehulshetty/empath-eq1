@@ -65,3 +65,9 @@ class CLSAConfig:
     # EQ module gets architectural privilege: it cross-attends to all
     # other modules at every deliberation step (see Section 3.2)
     eq_privileged: bool = True
+
+    # Numerical stability: symmetric bound for logvar and log-precision.
+    # tanh maps to [-logvar_range, +logvar_range], giving variance in
+    # [exp(-range), exp(+range)]. At 4.0: [~0.018, ~54.6].
+    logvar_range: float = 4.0
+    log_precision_range: float = 4.0

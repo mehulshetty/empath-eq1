@@ -24,6 +24,11 @@ def product_of_gaussians(
     Each module contributes a diagonal Gaussian N(mu_i, sigma^2_i). The
     combined distribution is also Gaussian, computed in closed form.
 
+    All arithmetic stays in log-space to avoid exp/log roundtrips that
+    overflow in reduced precision. The combined mean is computed as a
+    softmax-weighted average over module means, where the weights are
+    the normalized effective precisions.
+
     Args:
         mus: List of mean tensors, each (batch, seq_len, latent_dim).
         logvars: List of log-variance tensors, same shape.
@@ -34,25 +39,26 @@ def product_of_gaussians(
         combined_mu: (batch, seq_len, latent_dim) mean of combined distribution.
         combined_logvar: (batch, seq_len, latent_dim) log-variance of combined distribution.
     """
-    # Compute effective precision for each module:
-    # effective_precision_i = pi_i / sigma^2_i = pi_i * exp(-logvar_i)
-    effective_precisions = []
-    weighted_means = []
+    # Log effective precision per module: log(pi_i) - logvar_i
+    log_eff_precs = []
+    for logvar, pi in zip(logvars, precisions):
+        log_eff_precs.append(pi.log() - logvar)
 
-    for mu, logvar, pi in zip(mus, logvars, precisions):
-        # pi is a scalar (per-module weight), broadcast over all dimensions
-        eff_prec = pi * torch.exp(-logvar)
-        effective_precisions.append(eff_prec)
-        weighted_means.append(eff_prec * mu)
+    # (num_modules, batch, seq_len, latent_dim)
+    stacked_log_precs = torch.stack(log_eff_precs, dim=0)
 
-    # Combined precision is the sum of individual precisions
-    combined_precision = torch.stack(effective_precisions, dim=0).sum(dim=0)
+    # Combined log-precision via logsumexp (numerically stable)
+    combined_log_precision = torch.logsumexp(stacked_log_precs, dim=0)
+    combined_logvar = -combined_log_precision
+
+    # Normalized weights = softmax over log-precisions along module dim.
+    # Each weight is in [0, 1] and they sum to 1 — no overflow possible.
+    log_weights = stacked_log_precs - combined_log_precision.unsqueeze(0)
+    weights = log_weights.exp()
 
     # Combined mean is the precision-weighted average
-    combined_mu = torch.stack(weighted_means, dim=0).sum(dim=0) / combined_precision
-
-    # Combined variance is the inverse of combined precision
-    combined_logvar = -torch.log(combined_precision)
+    stacked_mus = torch.stack(mus, dim=0)
+    combined_mu = (weights * stacked_mus).sum(dim=0)
 
     return combined_mu, combined_logvar
 

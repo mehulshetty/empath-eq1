@@ -136,7 +136,10 @@ class CLSA(nn.Module):
         if value <= 0:
             raise ValueError("Precision must be positive")
         module = self.get_module(module_type)
-        module.log_precision.data = torch.tensor(value).log()
+        # Invert the tanh bounding: raw = atanh(log(value) / range)
+        target_log = torch.tensor(value).log()
+        raw = torch.atanh((target_log / module._log_precision_range).clamp(-0.999, 0.999))
+        module._log_precision_raw.data = raw
 
     def get_precisions(self) -> dict[str, float]:
         """Return current precision values for all modules."""

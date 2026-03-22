@@ -32,10 +32,14 @@ class EQReweightingField(nn.Module):
     Operates on the combined mu/logvar, producing a multiplicative
     reweighting of the combined distribution's precision (sharpening
     some dimensions, broadening others).
+
+    The reweighting factor is bounded via tanh to [-max_shift, +max_shift]
+    so EQ can never push logvar outside a safe range.
     """
 
-    def __init__(self, latent_dim: int, hidden_size: int):
+    def __init__(self, latent_dim: int, hidden_size: int, max_shift: float = 2.0):
         super().__init__()
+        self.max_shift = max_shift
         # Takes EQ hidden states and combined distribution parameters
         # to produce per-dimension reweighting factors
         self.net = nn.Sequential(
@@ -62,8 +66,8 @@ class EQReweightingField(nn.Module):
             only the variance is modulated.
         """
         context = torch.cat([eq_hidden, combined_mu, combined_logvar], dim=-1)
-        # Log-scale reweighting factor, centered at 0 (no change by default)
-        log_reweight = self.net(context)
+        # Bounded log-scale reweighting factor, centered at 0 (no change)
+        log_reweight = self.max_shift * torch.tanh(self.net(context))
         # Modulate the log-variance: adding to logvar divides the precision
         # Positive log_reweight = broader (less EQ confidence on this dim)
         # Negative log_reweight = sharper (more EQ confidence)
