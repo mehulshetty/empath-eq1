@@ -13,7 +13,7 @@ from clsa.evaluation.generation import (
     ResponseGenerator,
     generate_shared_benchmark,
 )
-from clsa.evaluation.openai_judge import JudgeScore, OpenAIJudge
+from clsa.evaluation.judge_types import JudgeScore
 from clsa.evaluation.stats import (
     JudgeAggregate,
     eq_range_from_aggregates,
@@ -89,7 +89,7 @@ class SeeSawEvaluator:
     def __init__(
         self,
         benchmark: list[BenchmarkExample],
-        judge: OpenAIJudge,
+        judge,
         generation_config: GenerationConfig,
         bootstrap_samples: int = 1000,
         bootstrap_seed: int = 0,
@@ -139,3 +139,29 @@ class SeeSawEvaluator:
         report = SeeSawReport(model_label=generator.model_label, points=point_results)
         logger.info("\n%s", report.summary())
         return report, all_responses, all_scores
+
+
+def build_report_from_scored_points(
+    model_label: str,
+    scored_points: list[tuple[GenerationControl, list[JudgeScore]]],
+    *,
+    bootstrap_samples: int = 1000,
+    bootstrap_seed: int = 0,
+) -> SeeSawReport:
+    """Build a see-saw report from already-annotated scores."""
+
+    point_results: list[SeeSawPointResult] = []
+    for offset, (control, scores) in enumerate(scored_points):
+        aggregate = summarize_judge_scores(
+            scores,
+            bootstrap_samples=bootstrap_samples,
+            seed=bootstrap_seed + offset,
+        )
+        point_results.append(
+            SeeSawPointResult(
+                control_name=control.name,
+                control_value=control.value,
+                aggregate=aggregate,
+            )
+        )
+    return SeeSawReport(model_label=model_label, points=point_results)

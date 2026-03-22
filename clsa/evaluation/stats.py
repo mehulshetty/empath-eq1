@@ -8,7 +8,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
-from clsa.evaluation.openai_judge import JudgeScore
+from clsa.evaluation.judge_types import JudgeScore
 
 
 @dataclass(frozen=True)

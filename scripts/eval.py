@@ -4,7 +4,7 @@ This script implements the surgical evaluation redesign:
 
 - Shared prompt benchmark for the actual see-saw claim
 - Generation-based comparison across all model families
-- OpenAI judge scoring on independent Logic and EQ axes
+- Manual, OpenAI, or You.com judging on independent Logic and EQ axes
 - Objective held-out probes scored at the answer level
 - Statistical summaries and export files for downstream plotting
 """
@@ -37,10 +37,14 @@ from clsa.evaluation.generation import (
     default_baseline_controls,
     default_clsa_controls,
     default_ensemble_controls,
+    generate_shared_benchmark,
 )
+from clsa.evaluation.manual_judge import export_manual_judge_csv, load_manual_judge_scores
 from clsa.evaluation.objective_probes import evaluate_generator_on_probes
-from clsa.evaluation.openai_judge import JudgeScore, OpenAIJudge
-from clsa.evaluation.seesaw_test import SeeSawEvaluator
+from clsa.evaluation.judge_types import JudgeScore
+from clsa.evaluation.openai_judge import OpenAIJudge
+from clsa.evaluation.seesaw_test import SeeSawEvaluator, build_report_from_scored_points
+from clsa.evaluation.you_judge import YouJudge
 from clsa.evaluation.stats import (
     JudgeAggregate,
     paired_bootstrap_delta,
@@ -108,12 +112,94 @@ def build_generation_config(args: argparse.Namespace, *, probe: bool = False) ->
     )
 
 
-def build_judge(args: argparse.Namespace) -> OpenAIJudge:
-    return OpenAIJudge(
-        model=args.judge_model,
-        rubric_path=args.rubric_path,
-        cache_dir=args.judge_cache_dir,
+def build_judge(args: argparse.Namespace):
+    if args.judge_mode == "openai":
+        return OpenAIJudge(
+            model=args.judge_model,
+            rubric_path=args.rubric_path,
+            cache_dir=args.judge_cache_dir,
+        )
+    if args.judge_mode == "you":
+        if not args.you_agent_id:
+            raise ValueError("--you-agent-id is required with --judge-mode you")
+        return YouJudge(
+            agent_id=args.you_agent_id,
+            rubric_path=args.rubric_path,
+            cache_dir=args.judge_cache_dir,
+            endpoint=args.you_api_endpoint,
+            timeout_s=args.you_timeout_s,
+        )
+    raise ValueError(f"Unsupported judge mode: {args.judge_mode}")
+
+
+def manual_export_path(output_dir: Path, stem: str) -> Path:
+    return output_dir / f"{stem}_manual_judge.csv"
+
+
+def build_manual_summary(stem: str, csv_path: Path, rubric_path: str, n_rows: int) -> str:
+    return "\n".join(
+        [
+            f"Manual judging export ready for `{stem}`.",
+            f"CSV: {csv_path}",
+            f"Rows to score: {n_rows}",
+            f"Rubric: {rubric_path}",
+            "",
+            "Fill in `logic_score`, `eq_score`, `hard_fail`, `hard_fail_reasons`,",
+            "`logic_rationale`, and `eq_rationale`, then rerun with",
+            f"`--judge-mode manual --manual-annotations {csv_path}`.",
+        ]
     )
+
+
+def control_key(control_name: str, control_value: float | str) -> tuple[str, str]:
+    return control_name, str(control_value)
+
+
+def index_scores_by_control(scores: list[JudgeScore]) -> dict[tuple[str, str], list[JudgeScore]]:
+    grouped: dict[tuple[str, str], list[JudgeScore]] = {}
+    for score in scores:
+        grouped.setdefault(control_key(score.control_name, score.control_value), []).append(score)
+    return grouped
+
+
+def build_scored_points(
+    scores: list[JudgeScore],
+    controls: list[GenerationControl],
+) -> list[tuple[GenerationControl, list[JudgeScore]]]:
+    score_map = index_scores_by_control(scores)
+    scored_points = []
+    for control in controls:
+        key = control_key(control.name, control.value)
+        control_scores = score_map.get(key, [])
+        if not control_scores:
+            raise ValueError(f"Missing manual annotations for control {control.name}={control.value}")
+        scored_points.append((control, control_scores))
+    return scored_points
+
+
+def generate_sweep_responses(
+    generator,
+    benchmark: list,
+    controls: list[GenerationControl],
+    generation_config: GenerationConfig,
+) -> list[GeneratedResponse]:
+    responses: list[GeneratedResponse] = []
+    for control in controls:
+        responses.extend(generate_shared_benchmark(generator, benchmark, control, generation_config))
+    return responses
+
+
+def build_pending_shared_benchmark_payload(
+    controls: list[GenerationControl],
+    manual_csv: Path,
+    n_responses: int,
+) -> dict:
+    return {
+        "status": "pending_manual_annotation",
+        "manual_judge_csv": str(manual_csv),
+        "n_responses": n_responses,
+        "controls": [{"name": control.name, "value": control.value} for control in controls],
+    }
 
 
 def build_single_generator(args: argparse.Namespace):
@@ -166,6 +252,29 @@ def run_seesaw(args: argparse.Namespace) -> dict:
     if args.max_examples is not None:
         benchmark = benchmark[: args.max_examples]
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    controls = default_clsa_controls()
+
+    if args.judge_mode == "manual" and args.manual_annotations:
+        scores = load_manual_judge_scores(args.manual_annotations)
+        model_labels = {score.model_label for score in scores}
+        if len(model_labels) != 1:
+            raise ValueError(
+                "Manual seesaw scoring expects exactly one model_label in the annotations CSV"
+            )
+        report = build_report_from_scored_points(
+            model_label=next(iter(model_labels)),
+            scored_points=build_scored_points(scores, controls),
+            bootstrap_samples=args.bootstrap_samples,
+            bootstrap_seed=args.bootstrap_seed,
+        )
+        (output_dir / "seesaw.json").write_text(json.dumps(report.to_dict(), indent=2))
+        write_jsonl(output_dir / "seesaw_judge_outputs.jsonl", [row.to_dict() for row in scores])
+        write_summary_markdown(output_dir / "seesaw_summary.md", report.summary())
+        print(report.summary())
+        return report.to_dict()
+
     tokenizer = load_shared_tokenizer()
     model = load_clsa_model(args.checkpoint, args.device)
     generator = CLSAGenerator(
@@ -174,18 +283,35 @@ def run_seesaw(args: argparse.Namespace) -> dict:
         device=args.device,
         model_label=args.generator_label or Path(args.checkpoint).stem,
     )
+    generation_config = build_generation_config(args)
+
+    if args.judge_mode == "manual":
+        responses = generate_sweep_responses(generator, benchmark, controls, generation_config)
+        csv_path = manual_export_path(output_dir, "seesaw")
+        export_manual_judge_csv({example.id: example for example in benchmark}, responses, csv_path)
+        write_jsonl(output_dir / "seesaw_responses.jsonl", [row.to_dict() for row in responses])
+        summary = build_manual_summary("seesaw", csv_path, args.rubric_path, len(responses))
+        write_summary_markdown(output_dir / "seesaw_summary.md", summary)
+        payload = {
+            "status": "pending_manual_annotation",
+            "manual_judge_csv": str(csv_path),
+            "n_responses": len(responses),
+            "controls": [{"name": control.name, "value": control.value} for control in controls],
+        }
+        (output_dir / "seesaw.json").write_text(json.dumps(payload, indent=2))
+        print(summary)
+        return payload
+
     judge = build_judge(args)
     evaluator = SeeSawEvaluator(
         benchmark=benchmark,
         judge=judge,
-        generation_config=build_generation_config(args),
+        generation_config=generation_config,
         bootstrap_samples=args.bootstrap_samples,
         bootstrap_seed=args.bootstrap_seed,
     )
-    report, responses, scores = evaluator.run_sweep(generator, default_clsa_controls())
+    report, responses, scores = evaluator.run_sweep(generator, controls)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "seesaw.json").write_text(json.dumps(report.to_dict(), indent=2))
     write_jsonl(output_dir / "seesaw_responses.jsonl", [row.to_dict() for row in responses])
     write_jsonl(output_dir / "seesaw_judge_outputs.jsonl", [row.to_dict() for row in scores])
@@ -221,22 +347,32 @@ def run_compare(args: argparse.Namespace) -> dict:
     benchmark = load_benchmark(args.benchmark_path)
     if args.max_examples is not None:
         benchmark = benchmark[: args.max_examples]
+    benchmark_by_id = {example.id: example for example in benchmark}
 
     logic_probes = load_logic_probe_examples(args.max_probe_examples)
     eq_probes = load_eq_probe_examples(args.max_probe_examples)
 
     generation_config = build_generation_config(args)
     probe_config = build_generation_config(args, probe=True)
-    judge = build_judge(args)
-    evaluator = SeeSawEvaluator(
-        benchmark=benchmark,
-        judge=judge,
-        generation_config=generation_config,
-        bootstrap_samples=args.bootstrap_samples,
-        bootstrap_seed=args.bootstrap_seed,
-    )
+    evaluator = None
+    manual_scores_by_label: dict[str, list[JudgeScore]] = {}
+    if args.judge_mode in {"openai", "you"}:
+        judge = build_judge(args)
+        evaluator = SeeSawEvaluator(
+            benchmark=benchmark,
+            judge=judge,
+            generation_config=generation_config,
+            bootstrap_samples=args.bootstrap_samples,
+            bootstrap_seed=args.bootstrap_seed,
+        )
+    elif args.judge_mode == "manual" and args.manual_annotations:
+        for score in load_manual_judge_scores(args.manual_annotations):
+            manual_scores_by_label.setdefault(score.model_label, []).append(score)
 
     shared_tokenizer = load_shared_tokenizer()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manual_csv = manual_export_path(output_dir, "compare")
 
     compare_results: dict[str, dict] = {}
     raw_responses: list[GeneratedResponse] = []
@@ -250,25 +386,56 @@ def run_compare(args: argparse.Namespace) -> dict:
         shared_controls: list[GenerationControl],
         probe_control: GenerationControl,
     ) -> None:
-        report, responses, scores = evaluator.run_sweep(generator, shared_controls)
+        shared_payload: dict
+
+        if args.judge_mode in {"openai", "you"}:
+            report, responses, scores = evaluator.run_sweep(generator, shared_controls)
+            shared_payload = report.to_dict()
+            raw_responses.extend(responses)
+            raw_scores.extend(scores)
+            for point in report.points:
+                csv_rows.append(
+                    _compare_row(method_label, point.control_name, point.control_value, point.aggregate)
+                )
+            for score in scores:
+                key = (method_label, score.control_name, str(score.control_value))
+                score_index.setdefault(key, []).append(score)
+        elif args.judge_mode == "manual" and args.manual_annotations:
+            method_scores = manual_scores_by_label.get(method_label, [])
+            report = build_report_from_scored_points(
+                model_label=method_label,
+                scored_points=build_scored_points(method_scores, shared_controls),
+                bootstrap_samples=args.bootstrap_samples,
+                bootstrap_seed=args.bootstrap_seed,
+            )
+            shared_payload = report.to_dict()
+            raw_scores.extend(method_scores)
+            for point in report.points:
+                csv_rows.append(
+                    _compare_row(method_label, point.control_name, point.control_value, point.aggregate)
+                )
+            for score in method_scores:
+                key = (method_label, score.control_name, str(score.control_value))
+                score_index.setdefault(key, []).append(score)
+        else:
+            responses = generate_sweep_responses(generator, benchmark, shared_controls, generation_config)
+            raw_responses.extend(responses)
+            shared_payload = build_pending_shared_benchmark_payload(
+                shared_controls,
+                manual_csv,
+                len(responses),
+            )
+
         logic_probe = evaluate_generator_on_probes(generator, logic_probes, probe_control, probe_config)
         eq_probe = evaluate_generator_on_probes(generator, eq_probes, probe_control, probe_config)
 
         compare_results[method_label] = {
-            "shared_benchmark": report.to_dict(),
+            "shared_benchmark": shared_payload,
             "objective_probes": {
                 "logic": logic_probe.to_dict(),
                 "eq": eq_probe.to_dict(),
             },
         }
-
-        raw_responses.extend(responses)
-        raw_scores.extend(scores)
-        for point in report.points:
-            csv_rows.append(_compare_row(method_label, point.control_name, point.control_value, point.aggregate))
-        for score in scores:
-            key = (method_label, score.control_name, str(score.control_value))
-            score_index.setdefault(key, []).append(score)
 
     if args.logic_backbone:
         logic_specialist = SpecialistGenerator(
@@ -381,28 +548,58 @@ def run_compare(args: argparse.Namespace) -> dict:
         if args.device == "cuda":
             torch.cuda.empty_cache()
 
-    summary = _build_compare_summary(compare_results, score_index, args.bootstrap_samples, args.bootstrap_seed)
+    summary = None
+    if raw_scores:
+        summary = _build_compare_summary(
+            compare_results,
+            score_index,
+            args.bootstrap_samples,
+            args.bootstrap_seed,
+        )
     full_payload = {
         "benchmark_path": args.benchmark_path,
-        "judge_model": args.judge_model,
+        "judge_mode": args.judge_mode,
         "shared_benchmark_examples": len(benchmark),
         "compare": compare_results,
         "summary": summary,
     }
+    if args.judge_mode == "openai":
+        full_payload["judge_model"] = args.judge_model
+    elif args.judge_mode == "you":
+        full_payload["you_agent_id"] = args.you_agent_id
+        full_payload["you_api_endpoint"] = args.you_api_endpoint
+    if args.manual_annotations:
+        full_payload["manual_annotations"] = args.manual_annotations
+    elif args.judge_mode == "manual":
+        full_payload["manual_judge_csv"] = str(manual_csv)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "compare.json").write_text(json.dumps(full_payload, indent=2))
-    write_compare_csv(output_dir / "compare.csv", csv_rows)
-    write_jsonl(output_dir / "judge_outputs.jsonl", [score.to_dict() for score in raw_scores])
-    write_jsonl(output_dir / "responses.jsonl", [response.to_dict() for response in raw_responses])
-    write_summary_markdown(output_dir / "compare_summary.md", _compare_summary_text(summary, compare_results))
-
-    print(_compare_summary_text(summary, compare_results))
+    if raw_responses:
+        write_jsonl(output_dir / "responses.jsonl", [response.to_dict() for response in raw_responses])
+    if raw_scores:
+        write_compare_csv(output_dir / "compare.csv", csv_rows)
+        write_jsonl(output_dir / "judge_outputs.jsonl", [score.to_dict() for score in raw_scores])
+        write_summary_markdown(output_dir / "compare_summary.md", _compare_summary_text(summary, compare_results))
+        print(_compare_summary_text(summary, compare_results))
+    else:
+        export_manual_judge_csv(benchmark_by_id, raw_responses, manual_csv)
+        summary_text = build_manual_summary(
+            "compare",
+            manual_csv,
+            args.rubric_path,
+            len(raw_responses),
+        )
+        write_summary_markdown(output_dir / "compare_summary.md", summary_text)
+        print(summary_text)
     return full_payload
 
 
 def run_full(args: argparse.Namespace) -> dict:
+    if args.judge_mode == "manual" and args.manual_annotations:
+        raise ValueError(
+            "Manual annotation import is supported on `seesaw` and `compare` separately. "
+            "Run those commands directly with `--manual-annotations`."
+        )
     results = {}
     if args.clsa_phase3:
         seesaw_args = argparse.Namespace(**{**vars(args), "checkpoint": args.clsa_phase3})
@@ -539,8 +736,18 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", default="eval_results")
     parser.add_argument("--benchmark-path", default="benchmarks/seesaw_benchmark.jsonl")
     parser.add_argument("--rubric-path", default="benchmarks/judge_rubric.md")
+    parser.add_argument("--judge-mode", default="manual", choices=["manual", "openai", "you"])
     parser.add_argument("--judge-model", default="gpt-4.1-mini")
     parser.add_argument("--judge-cache-dir", default="eval_results/judge_cache")
+    parser.add_argument("--you-agent-id", default=None,
+                        help="You.com custom agent ID to use when --judge-mode you")
+    parser.add_argument("--you-api-endpoint", default="https://api.you.com/v1/agents/runs")
+    parser.add_argument("--you-timeout-s", type=float, default=120.0)
+    parser.add_argument(
+        "--manual-annotations",
+        default=None,
+        help="Path to a completed manual judging CSV to import and score",
+    )
     parser.add_argument("--max-examples", type=int, default=None,
                         help="Cap shared benchmark examples for quick runs")
     parser.add_argument("--max-probe-examples", type=int, default=None,
@@ -599,6 +806,8 @@ def main():
     add_common_args(p_full)
 
     args = parser.parse_args()
+    if args.judge_mode != "manual" and args.manual_annotations:
+        parser.error("--manual-annotations can only be used with --judge-mode manual")
 
     if args.command == "seesaw":
         run_seesaw(args)
