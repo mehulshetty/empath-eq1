@@ -10,8 +10,11 @@ from clsa.model import CLSA
 from clsa.modules.transformer import TransformerForCausalLM
 from clsa.training.data import (
     TokenizedDataset,
+    _build_persuasion_supervised_examples,
     _collate_fn,
     _pack_supervised_token_ids,
+    _supervise_mathdial_example,
+    build_phase2_dataloader,
     build_combined_dataloader,
 )
 from clsa.training.trainer import (
@@ -147,6 +150,45 @@ def test_phase3_specialization_retainer_respects_interval():
     assert skipped.item() == 0.0
 
 
+def test_supervise_mathdial_example_emits_teacher_turns():
+    examples = _supervise_mathdial_example(
+        {
+            "question": "What is 2 + 2?",
+            "student_incorrect_solution": "I think it is 5.",
+            "student_profile": "Needs help checking arithmetic carefully.",
+            "conversation": (
+                "Teacher: (generic)Let's work through it together.|EOM|"
+                "Student: I think it is 5.|EOM|"
+                "Teacher: (focus)What happens if you count two more from 2?"
+            ),
+        }
+    )
+
+    assert len(examples) == 2
+    assert examples[0].target == "Let's work through it together."
+    assert "Math problem: What is 2 + 2?" in examples[1].prompt
+    assert "Student: I think it is 5." in examples[1].prompt
+    assert examples[1].target == "What happens if you count two more from 2?"
+
+
+def test_build_persuasion_supervised_examples_uses_only_persuader_turns():
+    dataset = _FakeDataset(
+        [
+            {"B2": "d1", "Turn": 0, "B4": 0, "Unit": "Hi, would you consider donating today?"},
+            {"B2": "d1", "Turn": 1, "B4": 1, "Unit": "Maybe, but I am not sure."},
+            {"B2": "d1", "Turn": 2, "B4": 0, "Unit": "Even a small amount would help children in need."},
+        ]
+    )
+
+    examples = _build_persuasion_supervised_examples(dataset)
+
+    assert len(examples) == 2
+    assert examples[0].target == "Hi, would you consider donating today?"
+    assert "Conversation so far:" in examples[1].prompt
+    assert "Persuadee: Maybe, but I am not sure." in examples[1].prompt
+    assert examples[1].target == "Even a small amount would help children in need."
+
+
 class _FakeDataset(list):
     def select(self, indices):
         return _FakeDataset([self[idx] for idx in indices])
@@ -180,7 +222,7 @@ class _FakeTokenizer:
         return {"input_ids": encoded}
 
 
-def test_build_combined_dataloader_uses_supervised_phase1_and_text_phase2(monkeypatch):
+def test_build_combined_dataloader_uses_supervised_phase1_and_phase2(monkeypatch):
     fake_datasets = {
         "logic": _FakeDataset(
             [{"question": "2+2?", "choices": {"label": ["A", "B"], "text": ["3", "4"]}, "answerKey": "B"}]
@@ -216,8 +258,8 @@ def test_build_combined_dataloader_uses_supervised_phase1_and_text_phase2(monkey
         data_module,
         "PHASE2_DATASETS",
         [
-            {"path": "phase2", "name": None, "split": "train", "formatter": "_format_counseling_example"},
-            {"path": "persuasion", "name": None, "split": "train", "formatter": "_format_persuasion_example"},
+            {"path": "phase2", "name": None, "split": "train", "formatter": "_supervise_counseling_phase2_example"},
+            {"path": "persuasion", "name": None, "split": "train", "builder": "_build_persuasion_supervised_examples"},
         ],
     )
     monkeypatch.setattr(data_module, "load_dataset", fake_load_dataset)
@@ -231,7 +273,67 @@ def test_build_combined_dataloader_uses_supervised_phase1_and_text_phase2(monkey
     batch = next(iter(dataloader))
 
     assert len(dataloader.dataset) == 4
-    # Supervised Phase 1 examples contribute prompt-masked labels.
+    # All sources now contribute prompt-masked labels.
     assert (batch["labels"] == -100).any()
     # The batch should still contain trainable target tokens.
+    assert (batch["labels"] != -100).any()
+
+
+def test_build_phase2_dataloader_uses_supervised_phase2_examples(monkeypatch):
+    fake_datasets = {
+        "phase2_counseling": _FakeDataset(
+            [{"Context": "I cannot focus lately.", "Response": "Let's slow down and look at what has changed recently."}]
+        ),
+        "phase2_math": _FakeDataset(
+            [
+                {
+                    "question": "What is 3 + 4?",
+                    "student_incorrect_solution": "I said 10.",
+                    "student_profile": "Needs help checking work.",
+                    "conversation": (
+                        "Teacher: (generic)Let's check it together.|EOM|"
+                        "Student: I said 10.|EOM|"
+                        "Teacher: (focus)What do you get if you count four more from 3?"
+                    ),
+                }
+            ]
+        ),
+    }
+
+    def fake_load_dataset(path, name=None, split=None):
+        return fake_datasets[path]
+
+    monkeypatch.setattr(
+        data_module,
+        "PHASE2_DATASETS",
+        [
+            {
+                "path": "phase2_counseling",
+                "name": None,
+                "split": "train",
+                "formatter": "_supervise_counseling_phase2_example",
+                "sampling_weight": 1.0,
+            },
+            {
+                "path": "phase2_math",
+                "name": None,
+                "split": "train",
+                "formatter": "_supervise_mathdial_example",
+                "sampling_weight": 1.0,
+            },
+        ],
+    )
+    monkeypatch.setattr(data_module, "load_dataset", fake_load_dataset)
+
+    dataloader = build_phase2_dataloader(
+        tokenizer=_FakeTokenizer(),
+        batch_size=8,
+        max_length=64,
+        num_workers=0,
+        max_samples=4,
+    )
+    batch = next(iter(dataloader))
+
+    assert len(dataloader.dataset) == 3
+    assert (batch["labels"] == -100).any()
     assert (batch["labels"] != -100).any()

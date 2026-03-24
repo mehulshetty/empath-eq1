@@ -10,6 +10,7 @@ All builders return standard PyTorch DataLoaders yielding dicts with
 
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from functools import partial
@@ -188,17 +189,18 @@ PHASE1_EQ_SUPERVISED_DATASETS = [
     },
 ]
 
-# Phase 2 datasets. Each requires both logical reasoning and emotional
-# intelligence -- no single module could produce a quality response alone.
-# Combined ~30K examples across 8 diverse domains to teach general-purpose
-# inter-module communication (not just counseling).
+# Phase 2 datasets. These are formatted as prompt/target supervision so CLSA
+# learns to answer from a prompt rather than continue a pre-rendered transcript.
+# The mix is balanced by source, not by raw row count, so the large medical
+# corpora do not overwhelm smaller dialogue-heavy domains.
 PHASE2_DATASETS = [
     # Counseling: problem diagnosis + empathetic response (~3.5K)
     {
         "path": "Amod/mental_health_counseling_conversations",
         "name": None,
         "split": "train",
-        "formatter": "_format_counseling_example",
+        "formatter": "_supervise_counseling_phase2_example",
+        "sampling_weight": 1.0,
     },
     # Patient-doctor dialogue: accurate medical reasoning + sensitivity (~112K,
     # sampled down). Patients describe symptoms, doctors must reason about
@@ -207,7 +209,8 @@ PHASE2_DATASETS = [
         "path": "lavita/medical-qa-datasets",
         "name": "chatdoctor_healthcaremagic",
         "split": "train",
-        "formatter": "_format_medical_dialogue_example",
+        "formatter": "_supervise_medical_dialogue_example",
+        "sampling_weight": 1.0,
     },
     # Medical Q&A: factual health info framed for patients (~16K, sampled down).
     # Requires translating clinical knowledge into patient-friendly language.
@@ -215,7 +218,8 @@ PHASE2_DATASETS = [
         "path": "keivalya/MedQuad-MedicalQnADataset",
         "name": None,
         "split": "train",
-        "formatter": "_format_medquad_example",
+        "formatter": "_supervise_medquad_example",
+        "sampling_weight": 1.0,
     },
     # Patient health info: accessible explanations of conditions (~5.9K,
     # sampled down). Bridges medical accuracy with plain-language framing.
@@ -223,43 +227,39 @@ PHASE2_DATASETS = [
         "path": "lavita/medical-qa-datasets",
         "name": "medical_meadow_wikidoc_patient_information",
         "split": "train",
-        "formatter": "_format_medical_dialogue_example",
+        "formatter": "_supervise_medical_dialogue_example",
+        "sampling_weight": 1.0,
     },
     # Emotional support conversations: structured strategies for helping
-    # people through crises (~0.9K). Annotated with support strategies
-    # like reflection, self-disclosure, providing suggestions.
+    # people through crises (~0.9K raw dialogues, expanded to turn-level
+    # supporter responses).
     {
         "path": "thu-coai/esconv",
         "name": None,
         "split": "train",
-        "formatter": "_format_esconv_example",
+        "formatter": "_supervise_esconv_phase2_example",
+        "sampling_weight": 1.0,
     },
     # Math tutoring: pedagogical logic + patience with struggling students
-    # (~2.2K). Teachers must reason about math while adapting to the
-    # student's confusion and emotional state.
+    # (~2.2K raw dialogues, expanded to teacher turns). Tutors must reason
+    # correctly while responding to confusion and frustration.
     {
         "path": "eth-nlped/mathdial",
         "name": None,
         "split": "train",
-        "formatter": "_format_mathdial_example",
-    },
-    # Negotiation: strategic reasoning + social dynamics and empathy (~1K).
-    # Campers negotiate resource allocation, requiring logical trade-off
-    # analysis combined with persuasion and rapport.
-    {
-        "path": "kchawla123/casino",
-        "name": None,
-        "split": "train",
-        "formatter": "_format_casino_example",
+        "formatter": "_supervise_mathdial_example",
+        "sampling_weight": 1.0,
     },
     # Persuasion for good: logical argumentation + empathetic appeal (~20.9K
-    # utterances, grouped into ~1K dialogues). Persuading someone to donate
-    # requires understanding their perspective and building a logical case.
+    # utterances, grouped into turn-level persuader responses). Persuading
+    # someone to donate requires understanding their perspective while
+    # building a reasoned, socially aware case.
     {
         "path": "spawn99/PersuasionForGood",
         "name": None,
         "split": "FullDialog",
-        "formatter": "_format_persuasion_example",
+        "builder": "_build_persuasion_supervised_examples",
+        "sampling_weight": 1.0,
     },
 ]
 
@@ -623,6 +623,106 @@ def _supervise_counseling_example(example: dict) -> SupervisedTextExample:
     return SupervisedTextExample(prompt=prompt, target=response)
 
 
+def _supervise_counseling_phase2_example(example: dict) -> SupervisedTextExample:
+    context = str(example.get("Context", "")).strip()
+    response = str(example.get("Response", "")).strip()
+    prompt = (
+        "Write the counselor's response. Keep it emotionally supportive and"
+        " practically helpful.\n\n"
+        f"Client: {context}\n\n"
+        "Counselor:"
+    )
+    return SupervisedTextExample(prompt=prompt, target=response)
+
+
+def _supervise_medical_dialogue_example(example: dict) -> SupervisedTextExample:
+    instruction = str(example.get("instruction", "")).strip()
+    patient_input = str(example.get("input", "")).strip()
+    doctor_output = str(example.get("output", "")).strip()
+
+    prompt_parts = [
+        "Write the clinician's response. Keep it medically grounded, clear, and appropriately empathetic."
+    ]
+    if instruction:
+        prompt_parts.append(f"Task: {instruction}")
+    if patient_input:
+        prompt_parts.append(f"Patient: {patient_input}")
+    prompt_parts.append("Clinician:")
+    return SupervisedTextExample(prompt="\n\n".join(prompt_parts), target=doctor_output)
+
+
+def _supervise_medquad_example(example: dict) -> SupervisedTextExample:
+    qtype = str(example.get("qtype", "")).strip()
+    question = str(example.get("Question", "")).strip()
+    answer = str(example.get("Answer", "")).strip()
+
+    prompt_parts = [
+        "Answer the patient's question in plain language. Be accurate, calm, and easy to follow."
+    ]
+    if qtype:
+        prompt_parts.append(f"Topic: {qtype}")
+    prompt_parts.append(f"Patient question: {question}")
+    prompt_parts.append("Answer:")
+    return SupervisedTextExample(prompt="\n\n".join(prompt_parts), target=answer)
+
+
+def _strip_parenthetical_tag(text: str) -> str:
+    return re.sub(r"^\([^)]+\)\s*", "", text.strip())
+
+
+def _split_dialogue_turn(turn: str) -> tuple[str, str]:
+    if ":" not in turn:
+        return "", turn.strip()
+    speaker, text = turn.split(":", 1)
+    return speaker.strip(), text.strip()
+
+
+def _supervise_mathdial_example(example: dict) -> list[SupervisedTextExample]:
+    question = str(example.get("question", "")).strip()
+    incorrect = str(example.get("student_incorrect_solution", "")).strip()
+    profile = str(example.get("student_profile", "")).strip()
+    conversation = str(example.get("conversation", "")).strip()
+
+    rendered_turns: list[str] = []
+    supervised_examples: list[SupervisedTextExample] = []
+
+    for raw_turn in conversation.split("|EOM|"):
+        raw_turn = raw_turn.strip()
+        if not raw_turn:
+            continue
+        speaker, text = _split_dialogue_turn(raw_turn)
+        if not text:
+            continue
+
+        clean_text = _strip_parenthetical_tag(text)
+        speaker_lower = speaker.lower()
+        rendered_speaker = "Tutor" if speaker_lower == "teacher" else "Student"
+
+        if speaker_lower == "teacher":
+            prompt_parts = [
+                "Write the tutor's next response. Be mathematically correct, encouraging, and responsive to the student's confusion."
+            ]
+            if question:
+                prompt_parts.append(f"Math problem: {question}")
+            if incorrect:
+                prompt_parts.append(f"Student's current attempt: {incorrect}")
+            if profile:
+                prompt_parts.append(f"Student profile: {profile}")
+            if rendered_turns:
+                prompt_parts.append("Conversation so far:\n" + "\n".join(rendered_turns))
+            prompt_parts.append("Tutor:")
+            supervised_examples.append(
+                SupervisedTextExample(
+                    prompt="\n\n".join(prompt_parts),
+                    target=clean_text,
+                )
+            )
+
+        rendered_turns.append(f"{rendered_speaker}: {clean_text}")
+
+    return supervised_examples
+
+
 def _supervise_esconv_example(example: dict) -> list[SupervisedTextExample]:
     data = json.loads(example["text"])
     situation = str(data.get("situation", "")).strip()
@@ -647,6 +747,50 @@ def _supervise_esconv_example(example: dict) -> list[SupervisedTextExample]:
                 prompt_parts.append(
                     "Context: "
                     + ", ".join(part for part in [emotion, problem] if part)
+                )
+            if situation:
+                prompt_parts.append(f"Situation: {situation}")
+            if rendered_turns:
+                prompt_parts.append("Conversation so far:\n" + "\n".join(rendered_turns))
+            if strategy:
+                prompt_parts.append(f"Support strategy: {strategy}")
+            prompt_parts.append("Supporter:")
+            supervised_examples.append(
+                SupervisedTextExample(
+                    prompt="\n\n".join(prompt_parts),
+                    target=text,
+                    metadata={"strategy": strategy},
+                )
+            )
+
+        rendered_turns.append(f"{speaker}: {text}")
+
+    return supervised_examples
+
+
+def _supervise_esconv_phase2_example(example: dict) -> list[SupervisedTextExample]:
+    data = json.loads(example["text"])
+    situation = str(data.get("situation", "")).strip()
+    emotion = str(data.get("emotion_type", "")).strip()
+    problem = str(data.get("problem_type", "")).strip()
+    dialog = data.get("dialog", [])
+
+    rendered_turns: list[str] = []
+    supervised_examples: list[SupervisedTextExample] = []
+    for turn in dialog:
+        speaker = "Seeker" if turn.get("speaker") == "usr" else "Supporter"
+        text = str(turn.get("text", "")).strip()
+        strategy = str(turn.get("strategy", "")).strip()
+        if not text:
+            continue
+
+        if speaker == "Supporter":
+            prompt_parts = [
+                "Write the supporter's next response. Be emotionally supportive, practical, and tactful."
+            ]
+            if emotion or problem:
+                prompt_parts.append(
+                    "Context: " + ", ".join(part for part in [emotion, problem] if part)
                 )
             if situation:
                 prompt_parts.append(f"Situation: {situation}")
@@ -920,6 +1064,46 @@ def _build_persuasion_dialogues(dataset) -> list[str]:
     return texts
 
 
+def _build_persuasion_supervised_examples(dataset) -> list[SupervisedTextExample]:
+    """Build turn-level persuader response examples from PersuasionForGood.
+
+    The raw split stores one utterance per row. We reconstruct each dialogue and
+    emit only the persuader turns so the task stays assistant-like: generate a
+    persuasive but socially aware next response.
+    """
+    dialogues: dict[str, list[tuple[int, int, str]]] = {}
+    for ex in dataset:
+        dialog_id = str(ex.get("B2", "")).strip()
+        turn = int(ex.get("Turn", 0))
+        role = int(ex.get("B4", 0))  # 0 = persuader, 1 = persuadee
+        text = str(ex.get("Unit", "")).strip()
+        if dialog_id and text:
+            dialogues.setdefault(dialog_id, []).append((turn, role, text))
+
+    supervised_examples: list[SupervisedTextExample] = []
+    for turns in dialogues.values():
+        turns.sort(key=lambda row: row[0])
+        rendered_turns: list[str] = []
+        for _, role, text in turns:
+            speaker = "Persuader" if role == 0 else "Persuadee"
+            if role == 0:
+                prompt_parts = [
+                    "Continue the fundraising conversation as the persuader. Be respectful, socially aware, and make a reasoned case."
+                ]
+                if rendered_turns:
+                    prompt_parts.append("Conversation so far:\n" + "\n".join(rendered_turns))
+                prompt_parts.append("Persuader:")
+                supervised_examples.append(
+                    SupervisedTextExample(
+                        prompt="\n\n".join(prompt_parts),
+                        target=text,
+                    )
+                )
+            rendered_turns.append(f"{speaker}: {text}")
+
+    return supervised_examples
+
+
 # Formatter lookup so dataset configs can reference them by name.
 _FORMATTERS = {
     "_format_arc_example": _format_arc_example,
@@ -951,7 +1135,16 @@ _SUPERVISED_FORMATTERS = {
     "_supervise_emotion_example": _supervise_emotion_example,
     "_supervise_prosocial_example": _supervise_prosocial_example,
     "_supervise_counseling_example": _supervise_counseling_example,
+    "_supervise_counseling_phase2_example": _supervise_counseling_phase2_example,
+    "_supervise_medical_dialogue_example": _supervise_medical_dialogue_example,
+    "_supervise_medquad_example": _supervise_medquad_example,
     "_supervise_esconv_example": _supervise_esconv_example,
+    "_supervise_esconv_phase2_example": _supervise_esconv_phase2_example,
+    "_supervise_mathdial_example": _supervise_mathdial_example,
+}
+
+_SUPERVISED_DATASET_BUILDERS = {
+    "_build_persuasion_supervised_examples": _build_persuasion_supervised_examples,
 }
 
 
@@ -1073,6 +1266,148 @@ def _tokenize_supervised_texts(
     return tokenized_examples
 
 
+def _extend_supervised_examples(
+    sink: list[SupervisedTextExample],
+    formatted: SupervisedTextExample | list[SupervisedTextExample] | None,
+) -> None:
+    if formatted is None:
+        return
+    if isinstance(formatted, list):
+        sink.extend(example for example in formatted if example.is_valid())
+        return
+    if formatted.is_valid():
+        sink.append(formatted)
+
+
+def _sample_examples_deterministically(
+    examples: list[SupervisedTextExample],
+    cap: int,
+    *,
+    seed: int,
+) -> list[SupervisedTextExample]:
+    if cap >= len(examples):
+        return list(examples)
+    rng = random.Random(seed)
+    indices = list(range(len(examples)))
+    rng.shuffle(indices)
+    return [examples[idx] for idx in indices[:cap]]
+
+
+def _allocate_balanced_caps(
+    available_counts: list[int],
+    weights: list[float],
+    max_total: int,
+) -> list[int]:
+    """Allocate a capped total budget across sources using source weights.
+
+    This is intentionally source-balanced rather than raw-row-proportional so a
+    single huge corpus does not dominate the mixture.
+    """
+    if max_total <= 0:
+        return [0 for _ in available_counts]
+
+    caps = [0 for _ in available_counts]
+    remaining_budget = max_total
+    remaining = {
+        idx for idx, available in enumerate(available_counts) if available > 0
+    }
+
+    while remaining and remaining_budget > 0:
+        total_weight = sum(weights[idx] for idx in remaining)
+        if total_weight <= 0:
+            break
+
+        allocated_this_round = 0
+        for idx in list(remaining):
+            remaining_capacity = available_counts[idx] - caps[idx]
+            if remaining_capacity <= 0:
+                remaining.discard(idx)
+                continue
+
+            share = int(remaining_budget * (weights[idx] / total_weight))
+            if share <= 0:
+                continue
+
+            share = min(share, remaining_capacity)
+            caps[idx] += share
+            allocated_this_round += share
+            if caps[idx] >= available_counts[idx]:
+                remaining.discard(idx)
+
+        remaining_budget -= allocated_this_round
+        if remaining_budget <= 0 or not remaining:
+            break
+
+        if allocated_this_round == 0:
+            for idx in sorted(remaining, key=lambda i: weights[i], reverse=True):
+                if remaining_budget <= 0:
+                    break
+                caps[idx] += 1
+                remaining_budget -= 1
+                if caps[idx] >= available_counts[idx]:
+                    remaining.discard(idx)
+
+    return caps
+
+
+def _load_weighted_supervised_sources(
+    dataset_configs: list[dict],
+    max_samples: int | None = None,
+    *,
+    sample_seed: int = 0,
+) -> list[SupervisedTextExample]:
+    """Load prompt/target sources and optionally sample them with source balance."""
+    per_source_examples: list[tuple[dict, list[SupervisedTextExample]]] = []
+
+    for cfg in dataset_configs:
+        logger.info("Loading dataset: %s (%s)", cfg["path"], cfg.get("name"))
+        ds = load_dataset(cfg["path"], cfg.get("name"), split=cfg["split"])
+
+        examples: list[SupervisedTextExample] = []
+        if "builder" in cfg:
+            builder = _SUPERVISED_DATASET_BUILDERS[cfg["builder"]]
+            examples = builder(ds)
+        else:
+            formatter = _SUPERVISED_FORMATTERS[cfg["formatter"]]
+            for record in ds:
+                _extend_supervised_examples(examples, formatter(record))
+
+        logger.info(
+            "Built %d supervised examples from %s",
+            len(examples),
+            cfg.get("builder") or cfg["formatter"],
+        )
+        per_source_examples.append((cfg, examples))
+
+    if max_samples is None:
+        return [
+            example
+            for _, examples in per_source_examples
+            for example in examples
+        ]
+
+    available_counts = [len(examples) for _, examples in per_source_examples]
+    weights = [float(cfg.get("sampling_weight", 1.0)) for cfg, _ in per_source_examples]
+    caps = _allocate_balanced_caps(available_counts, weights, max_samples)
+
+    sampled_examples: list[SupervisedTextExample] = []
+    for idx, ((cfg, examples), cap) in enumerate(zip(per_source_examples, caps)):
+        source_examples = _sample_examples_deterministically(
+            examples,
+            cap,
+            seed=sample_seed + idx,
+        )
+        logger.info(
+            "Sampling %d/%d supervised examples from %s",
+            len(source_examples),
+            len(examples),
+            cfg["path"],
+        )
+        sampled_examples.extend(source_examples)
+
+    return sampled_examples
+
+
 def _load_and_format_datasets(
     dataset_configs: list[dict],
     max_samples: int | None = None,
@@ -1141,12 +1476,7 @@ def _load_and_format_supervised_datasets(
         logger.info("Formatting %d examples with %s", len(ds), formatter_name)
         for record in ds:
             formatted = formatter(record)
-            if formatted is None:
-                continue
-            if isinstance(formatted, list):
-                supervised_examples.extend(example for example in formatted if example.is_valid())
-            elif formatted.is_valid():
-                supervised_examples.append(formatted)
+            _extend_supervised_examples(supervised_examples, formatted)
 
     return supervised_examples
 
@@ -1221,23 +1551,18 @@ def build_phase2_dataloader(
 ) -> DataLoader:
     """Build a DataLoader for Phase 2/3 multi-faculty training.
 
-    Combines 8 diverse datasets spanning counseling, medical dialogue,
-    tutoring, negotiation, persuasion, and emotional support. Every
-    dataset requires both logical reasoning and emotional intelligence,
-    ensuring the cross-attention layers learn general-purpose
-    inter-module communication rather than overfitting to a single domain.
-
-    Total unsampled size: ~160K examples. With proportional sampling
-    via max_samples (default ~32K), each domain contributes a balanced
-    share relative to its raw size.
+    Uses structured prompt/target supervision across diverse domains so the
+    decoder learns to answer from a prompt rather than continue a pre-rendered
+    transcript. Sampling is source-balanced after formatting, which prevents the
+    very large medical corpora from overwhelming smaller dialogue-heavy domains.
 
     Args:
         tokenizer: the tokenizer to use.
         batch_size: training batch size.
         max_length: maximum sequence length.
-        max_samples: optional cap on total examples. Applied
-            proportionally across datasets. Defaults to 32000 to
-            keep training tractable while covering all domains.
+        max_samples: optional cap on total prompt/target examples.
+            Defaults to 32000 to keep training tractable while preserving a
+            balanced source mixture.
         num_workers: DataLoader worker count.
 
     Returns:
@@ -1245,83 +1570,19 @@ def build_phase2_dataloader(
     """
     if max_samples is None:
         max_samples = 32000
-
-    # PersuasionForGood needs special handling: its rows are individual
-    # utterances that must be grouped into dialogues before formatting.
-    # We split it out from the standard pipeline.
-    standard_configs = [
-        cfg for cfg in PHASE2_DATASETS
-        if cfg["formatter"] != "_format_persuasion_example"
-    ]
-    persuasion_config = next(
-        (cfg for cfg in PHASE2_DATASETS
-         if cfg["formatter"] == "_format_persuasion_example"),
-        None,
+    supervised_examples = _load_weighted_supervised_sources(
+        PHASE2_DATASETS,
+        max_samples=max_samples,
+        sample_seed=17,
     )
-
-    # Load standard datasets (all except PersuasionForGood)
-    raw_datasets = []
-    for cfg in standard_configs:
-        logger.info("Loading dataset: %s (%s)", cfg["path"], cfg.get("name"))
-        ds = load_dataset(cfg["path"], cfg.get("name"), split=cfg["split"])
-        raw_datasets.append((ds, cfg["formatter"]))
-
-    # Load and group PersuasionForGood dialogues
-    persuasion_texts = []
-    if persuasion_config is not None:
-        logger.info(
-            "Loading dataset: %s (grouping utterances into dialogues)",
-            persuasion_config["path"],
-        )
-        persuasion_ds = load_dataset(
-            persuasion_config["path"],
-            persuasion_config.get("name"),
-            split=persuasion_config["split"],
-        )
-        persuasion_texts = _build_persuasion_dialogues(persuasion_ds)
-        logger.info(
-            "Built %d persuasion dialogues from %d utterances",
-            len(persuasion_texts), len(persuasion_ds),
-        )
-
-    # Compute proportional caps across all sources
-    standard_total = sum(len(ds) for ds, _ in raw_datasets)
-    persuasion_total = len(persuasion_texts)
-    grand_total = standard_total + persuasion_total
-
-    texts = []
-
-    # Format standard datasets with proportional sampling
-    for ds, formatter_name in raw_datasets:
-        formatter = _FORMATTERS[formatter_name]
-        cap = max(1, int(max_samples * len(ds) / grand_total))
-        cap = min(cap, len(ds))
-        ds_sampled = ds.select(range(cap))
-
-        logger.info(
-            "Formatting %d/%d examples with %s",
-            cap, len(ds), formatter_name,
-        )
-        formatted = [formatter(ex) for ex in ds_sampled]
-        texts.extend(t for t in formatted if t)
-
-    # Add proportionally sampled persuasion dialogues
-    if persuasion_texts:
-        cap = max(1, int(max_samples * persuasion_total / grand_total))
-        cap = min(cap, len(persuasion_texts))
-        logger.info(
-            "Adding %d/%d persuasion dialogues",
-            cap, len(persuasion_texts),
-        )
-        texts.extend(persuasion_texts[:cap])
 
     logger.info(
-        "Phase 2: %d total examples across %d datasets",
-        len(texts), len(PHASE2_DATASETS),
+        "Phase 2: %d prompt/target examples across %d datasets",
+        len(supervised_examples), len(PHASE2_DATASETS),
     )
 
-    logger.info("Tokenizing %d examples (max_length=%d)", len(texts), max_length)
-    examples = _tokenize_texts(texts, tokenizer, max_length)
+    logger.info("Tokenizing %d examples (max_length=%d)", len(supervised_examples), max_length)
+    examples = _tokenize_supervised_texts(supervised_examples, tokenizer, max_length)
     logger.info("Produced %d tokenized examples", len(examples))
 
     dataset = TokenizedDataset(examples)
@@ -1348,122 +1609,38 @@ def build_combined_dataloader(
     """Build a DataLoader combining ALL training data for baseline fine-tuning.
 
     Merges the current CLSA training corpora into a single monolithic baseline
-    dataloader:
-    - Phase 1 logic prompt/target supervision with target-only masking
-    - Phase 1 EQ prompt/target supervision with target-only masking
-    - Phase 2/3 multi-faculty text corpora using the existing whole-sequence
-      causal-LM objective
+    dataloader, using prompt/target supervision throughout:
+    - Phase 1 logic supervision
+    - Phase 1 EQ supervision
+    - Phase 2/3 multi-faculty response supervision
 
-    This keeps the baseline aligned with the current CLSA data design without
-    forcing the baseline into the same phased optimization schedule.
+    This keeps the baseline aligned with the corrected CLSA data design
+    without forcing the baseline into the same phased optimization schedule.
 
     Args:
         tokenizer: the tokenizer to use.
         batch_size: training batch size.
         max_length: maximum sequence length.
-        max_samples: optional cap on total examples (applied proportionally).
+        max_samples: optional cap on total prompt/target examples.
         num_workers: DataLoader worker count.
 
     Returns:
         DataLoader yielding {"input_ids": ..., "labels": ...} dicts.
     """
-    phase1_configs = PHASE1_LOGIC_SUPERVISED_DATASETS + PHASE1_EQ_SUPERVISED_DATASETS
-    phase2_standard_configs = [
-        cfg for cfg in PHASE2_DATASETS if cfg["formatter"] != "_format_persuasion_example"
-    ]
-    persuasion_config = next(
-        (cfg for cfg in PHASE2_DATASETS if cfg["formatter"] == "_format_persuasion_example"),
-        None,
+    all_configs = (
+        PHASE1_LOGIC_SUPERVISED_DATASETS
+        + PHASE1_EQ_SUPERVISED_DATASETS
+        + PHASE2_DATASETS
+    )
+    supervised_examples = _load_weighted_supervised_sources(
+        all_configs,
+        max_samples=max_samples,
+        sample_seed=29,
     )
 
-    sources = []
-    for cfg in phase1_configs:
-        logger.info("Loading dataset: %s (%s)", cfg["path"], cfg.get("name"))
-        ds = load_dataset(cfg["path"], cfg.get("name"), split=cfg["split"])
-        sources.append(
-            {
-                "kind": "supervised",
-                "dataset": ds,
-                "formatter_name": cfg["formatter"],
-            }
-        )
-
-    for cfg in phase2_standard_configs:
-        logger.info("Loading dataset: %s (%s)", cfg["path"], cfg.get("name"))
-        ds = load_dataset(cfg["path"], cfg.get("name"), split=cfg["split"])
-        sources.append(
-            {
-                "kind": "text",
-                "dataset": ds,
-                "formatter_name": cfg["formatter"],
-            }
-        )
-
-    if persuasion_config is not None:
-        logger.info(
-            "Loading dataset: %s (grouping utterances into dialogues)",
-            persuasion_config["path"],
-        )
-        persuasion_ds = load_dataset(
-            persuasion_config["path"],
-            persuasion_config.get("name"),
-            split=persuasion_config["split"],
-        )
-        persuasion_texts = _build_persuasion_dialogues(persuasion_ds)
-        sources.append(
-            {
-                "kind": "text_list",
-                "dataset": persuasion_texts,
-                "formatter_name": "_format_persuasion_example",
-            }
-        )
-
-    total_available = sum(len(source["dataset"]) for source in sources)
-    supervised_examples: list[SupervisedTextExample] = []
-    texts: list[str] = []
-
-    for source in sources:
-        dataset = source["dataset"]
-        if max_samples is not None:
-            cap = max(1, int(max_samples * len(dataset) / total_available))
-            cap = min(cap, len(dataset))
-        else:
-            cap = len(dataset)
-
-        if source["kind"] == "supervised":
-            formatter = _SUPERVISED_FORMATTERS[source["formatter_name"]]
-            dataset = dataset.select(range(cap))
-            logger.info("Formatting %d examples with %s", len(dataset), source["formatter_name"])
-            for record in dataset:
-                formatted = formatter(record)
-                if formatted is None:
-                    continue
-                if isinstance(formatted, list):
-                    supervised_examples.extend(example for example in formatted if example.is_valid())
-                elif formatted.is_valid():
-                    supervised_examples.append(formatted)
-            continue
-
-        if source["kind"] == "text":
-            formatter = _FORMATTERS[source["formatter_name"]]
-            dataset = dataset.select(range(cap))
-            logger.info("Formatting %d examples with %s", len(dataset), source["formatter_name"])
-            formatted = [formatter(ex) for ex in dataset]
-            texts.extend(text for text in formatted if text)
-            continue
-
-        # text_list
-        logger.info("Adding %d/%d persuasion dialogues", cap, len(dataset))
-        texts.extend(dataset[:cap])
-
-    logger.info(
-        "Combined baseline: %d supervised examples and %d text examples",
-        len(supervised_examples),
-        len(texts),
-    )
+    logger.info("Combined baseline: %d supervised examples", len(supervised_examples))
 
     examples = _tokenize_supervised_texts(supervised_examples, tokenizer, max_length)
-    examples.extend(_tokenize_texts(texts, tokenizer, max_length))
     logger.info("Produced %d tokenized examples", len(examples))
 
     dataset = TokenizedDataset(examples)

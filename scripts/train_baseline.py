@@ -13,8 +13,8 @@ Usage:
 
 The training loop mirrors the CLSA optimization settings (optimizer, LR,
 grad clipping, AMP). Its data path now mirrors the current CLSA corpus
-format as well: structured Phase 1 prompt/target supervision plus the
-existing Phase 2/3 multi-faculty text corpus.
+format as well: structured prompt/target supervision across Phase 1 and
+Phase 2/3 corpora.
 """
 
 import argparse
